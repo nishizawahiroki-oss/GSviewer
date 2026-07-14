@@ -99,9 +99,25 @@
       .control { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; margin: 9px 0; font-size: 13px; }
       .control input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
       .control input[type="color"] { width: 44px; height: 28px; padding: 1px; border: 0; background: transparent; }
+      .flip-group { display: flex; gap: 12px; }
+      .flip-group label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+      .flip-group input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
       .button-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
       .help { color: var(--muted); font-size: 11px; line-height: 1.65; }
       .help strong { color: var(--text); font-weight: 600; }
+
+      .axis-gizmo {
+        position: fixed;
+        left: 14px;
+        bottom: 56px;
+        width: 96px;
+        height: 96px;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+        z-index: 2;
+      }
 
       .gpu-badge {
         position: fixed;
@@ -186,7 +202,14 @@
           <span>不透明度しきい値</span><output id="alpha-threshold-value">0.00</output>
           <input id="alpha-threshold" type="range" min="0" max="1" step="0.01" value="0" aria-label="不透明度しきい値" />
         </label>
-        <label class="control"><span>Z 反転</span><input id="flip-z" type="checkbox" /></label>
+        <div class="control flip-row">
+          <span>軸反転</span>
+          <span class="flip-group">
+            <label><input id="flip-x" type="checkbox" /> X</label>
+            <label><input id="flip-y" type="checkbox" /> Y</label>
+            <label><input id="flip-z" type="checkbox" /> Z</label>
+          </span>
+        </div>
         <label class="control"><span>背景色</span><input id="background" type="color" value="#10131a" /></label>
       </section>
 
@@ -205,6 +228,7 @@
       </section>
     </aside>
 
+    <canvas id="axis-gizmo" class="axis-gizmo" width="192" height="192" aria-label="座標軸ギズモ"></canvas>
     <div id="gpu-info" class="gpu-badge">WebGL2 GPU を確認中…</div>
 
     <div id="loading" class="loading">

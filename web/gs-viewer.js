@@ -17,7 +17,10 @@ const ui = Object.fromEntries(
     "splat-scale-value",
     "alpha-threshold",
     "alpha-threshold-value",
+    "flip-x",
+    "flip-y",
     "flip-z",
+    "axis-gizmo",
     "fit-scene",
     "gpu-info",
     "loading",
@@ -379,16 +382,20 @@ function boundsRadius(box) {
   );
 }
 
-// The scene mirrors about z=0 when Z-flip is on; orbit.target lives in the
+// The scene mirrors about the flipped planes; orbit.target lives in the
 // displayed (possibly flipped) world.
-function zSign() {
-  return ui["flip-z"].checked ? -1 : 1;
+function flipSigns() {
+  return [
+    ui["flip-x"].checked ? -1 : 1,
+    ui["flip-y"].checked ? -1 : 1,
+    ui["flip-z"].checked ? -1 : 1,
+  ];
 }
 
 function fitBounds(box) {
   if (!box) return;
-  orbit.target = [0, 1, 2].map((axis) => (box.min[axis] + box.max[axis]) / 2);
-  orbit.target[2] *= zSign();
+  const signs = flipSigns();
+  orbit.target = [0, 1, 2].map((axis) => signs[axis] * (box.min[axis] + box.max[axis]) / 2);
   const radius = boundsRadius(box);
   const aspect = Math.max(0.25, canvas.clientWidth / Math.max(1, canvas.clientHeight));
   const fovY = Math.PI / 4;
@@ -439,12 +446,16 @@ function render() {
   const eyeOffset = cameraOffset();
   const eye = [0, 1, 2].map((axis) => orbit.target[axis] + eyeOffset[axis]);
   const view = lookAtCV(eye, orbit.target, [0, 1, 0]);
-  if (zSign() < 0) {
-    // view * diag(1, 1, -1, 1): mirrors world positions AND covariances.
-    view[8] = -view[8];
-    view[9] = -view[9];
-    view[10] = -view[10];
+  // view * diag(sx, sy, sz, 1): mirrors world positions AND covariances.
+  const signs = flipSigns();
+  for (let axis = 0; axis < 3; axis += 1) {
+    if (signs[axis] < 0) {
+      view[axis * 4] = -view[axis * 4];
+      view[axis * 4 + 1] = -view[axis * 4 + 1];
+      view[axis * 4 + 2] = -view[axis * 4 + 2];
+    }
   }
+  drawAxisGizmo(view);
   const viewProj = multiplyMatrices(projection, view);
   maybeRequestSort(viewProj);
   if (!sortedCount) return;
@@ -599,11 +610,58 @@ ui["splat-scale"].addEventListener("input", () => {
 ui["alpha-threshold"].addEventListener("input", () => {
   ui["alpha-threshold-value"].textContent = Number.parseFloat(ui["alpha-threshold"].value).toFixed(2);
 });
-ui["flip-z"].addEventListener("input", () => {
-  // Keep the camera on the object: convert the stored target into the new
-  // displayed world.
-  orbit.target[2] = -orbit.target[2];
-});
+for (const [axis, id] of [[0, "flip-x"], [1, "flip-y"], [2, "flip-z"]]) {
+  ui[id].addEventListener("input", () => {
+    // Keep the camera on the object: convert the stored target into the new
+    // displayed world.
+    orbit.target[axis] = -orbit.target[axis];
+  });
+}
+
+// Corner gizmo: shows where the data's +X/+Y/+Z axes point on screen,
+// including the current axis flips (view columns already carry the signs).
+const gizmoContext = ui["axis-gizmo"].getContext("2d");
+
+function drawAxisGizmo(view) {
+  const context = gizmoContext;
+  if (!context) return;
+  const size = ui["axis-gizmo"].width;
+  const center = size / 2;
+  const reach = size * 0.36;
+  context.clearRect(0, 0, size, size);
+
+  const axes = [
+    { label: "X", color: "#ff5a52", camera: [view[0], view[1], view[2]] },
+    { label: "Y", color: "#62dda1", camera: [view[4], view[5], view[6]] },
+    { label: "Z", color: "#65b8ff", camera: [view[8], view[9], view[10]] },
+  ];
+  // Camera space is +X right, +Y down, +Z forward, so screen = (x, y) directly;
+  // draw far-pointing axes first so near ones overlay them.
+  axes.sort((a, b) => b.camera[2] - a.camera[2]);
+
+  for (const axis of axes) {
+    const tipX = center + axis.camera[0] * reach;
+    const tipY = center + axis.camera[1] * reach;
+    const towardViewer = axis.camera[2] <= 0;
+    context.globalAlpha = towardViewer ? 1 : 0.45;
+    context.strokeStyle = axis.color;
+    context.fillStyle = axis.color;
+    context.lineWidth = 4;
+    context.beginPath();
+    context.moveTo(center, center);
+    context.lineTo(tipX, tipY);
+    context.stroke();
+    context.beginPath();
+    context.arc(tipX, tipY, 10, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = "#10131a";
+    context.font = "bold 13px ui-sans-serif, sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(axis.label, tipX, tipY + 0.5);
+  }
+  context.globalAlpha = 1;
+}
 ui["fit-scene"].addEventListener("click", () => {
   if (bounds) fitBounds(bounds.robust || bounds.all);
 });
