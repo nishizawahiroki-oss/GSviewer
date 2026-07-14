@@ -73,6 +73,13 @@ class PlyProperty:
 
 
 @dataclass(frozen=True)
+class PlyElement:
+    name: str
+    count: int
+    record_bytes: int
+
+
+@dataclass(frozen=True)
 class PlyHeader:
     path: Path
     header_bytes: int
@@ -80,9 +87,13 @@ class PlyHeader:
     record_bytes: int
     properties: tuple[PlyProperty, ...]
     comments: tuple[str, ...]
+    elements: tuple[PlyElement, ...]
 
     def property(self, name: str) -> PlyProperty | None:
         return next((item for item in self.properties if item.name == name), None)
+
+    def element(self, name: str) -> PlyElement | None:
+        return next((item for item in self.elements if item.name == name), None)
 
 
 @dataclass(frozen=True)
@@ -151,12 +162,10 @@ def read_ply_header(path: Path) -> PlyHeader:
     if "format binary_little_endian 1.0" not in (line.strip() for line in lines):
         raise PlyError("Only binary_little_endian PLY 1.0 is supported.")
 
-    vertex_count: int | None = None
-    current_element: str | None = None
+    elements: list[dict[str, object]] = []
+    current_element: dict[str, object] | None = None
     vertex_properties: list[PlyProperty] = []
-    vertex_record_bytes = 0
     comments: list[str] = []
-    non_vertex_elements: list[tuple[str, int]] = []
 
     for line in lines[1:]:
         parts = line.strip().split()
@@ -165,33 +174,40 @@ def read_ply_header(path: Path) -> PlyHeader:
         if parts[0] == "comment":
             comments.append(line.partition("comment")[2].strip())
         elif parts[0] == "element" and len(parts) == 3:
-            current_element = parts[1]
             try:
                 count = int(parts[2])
             except ValueError as exc:
                 raise PlyError(f"Invalid element count: {line}") from exc
-            if current_element == "vertex":
-                if vertex_count is not None:
+            if count < 0:
+                raise PlyError(f"Invalid negative element count: {line}")
+            if parts[1] == "vertex" and any(item["name"] == "vertex" for item in elements):
                     raise PlyError("Multiple vertex elements are not supported.")
-                vertex_count = count
-            elif count:
-                non_vertex_elements.append((current_element, count))
-        elif parts[0] == "property" and current_element == "vertex":
+            current_element = {"name": parts[1], "count": count, "record_bytes": 0}
+            elements.append(current_element)
+        elif parts[0] == "property":
+            if current_element is None:
+                raise PlyError(f"Property appears before an element: {line}")
             if len(parts) >= 2 and parts[1] == "list":
-                raise PlyError("List properties on the vertex element are not supported.")
+                raise PlyError("List properties are not supported.")
             if len(parts) != 3 or parts[1] not in PLY_TYPE_SIZES:
-                raise PlyError(f"Unsupported vertex property: {line}")
-            vertex_properties.append(
-                PlyProperty(parts[2], parts[1], vertex_record_bytes)
-            )
-            vertex_record_bytes += PLY_TYPE_SIZES[parts[1]]
+                raise PlyError(f"Unsupported property: {line}")
+            offset = int(current_element["record_bytes"])
+            if current_element["name"] == "vertex":
+                vertex_properties.append(PlyProperty(parts[2], parts[1], offset))
+            current_element["record_bytes"] = offset + PLY_TYPE_SIZES[parts[1]]
 
-    if vertex_count is None:
+    vertex_element = next((item for item in elements if item["name"] == "vertex"), None)
+    if vertex_element is None:
         raise PlyError("PLY has no vertex element.")
+    vertex_count = int(vertex_element["count"])
+    vertex_record_bytes = int(vertex_element["record_bytes"])
     if vertex_count <= 0:
         raise PlyError("PLY vertex element is empty.")
-    if non_vertex_elements:
-        details = ", ".join(f"{name}={count}" for name, count in non_vertex_elements)
+    if not elements or elements[0]["name"] != "vertex":
+        raise PlyError("The vertex element must be the first PLY element.")
+    unsupported = [item for item in elements if item["name"] not in {"vertex", "camera"} and item["count"]]
+    if unsupported:
+        details = ", ".join(f"{item['name']}={item['count']}" for item in unsupported)
         raise PlyError(f"Additional populated PLY elements are not supported: {details}")
 
     names = {item.name for item in vertex_properties}
@@ -199,7 +215,9 @@ def read_ply_header(path: Path) -> PlyHeader:
     if missing:
         raise PlyError(f"PLY is missing position properties: {', '.join(sorted(missing))}")
 
-    expected_size = len(raw_header) + vertex_count * vertex_record_bytes
+    expected_size = len(raw_header) + sum(
+        int(item["count"]) * int(item["record_bytes"]) for item in elements
+    )
     actual_size = path.stat().st_size
     if actual_size != expected_size:
         raise PlyError(
@@ -214,10 +232,50 @@ def read_ply_header(path: Path) -> PlyHeader:
         record_bytes=vertex_record_bytes,
         properties=tuple(vertex_properties),
         comments=tuple(comments),
+        elements=tuple(
+            PlyElement(str(item["name"]), int(item["count"]), int(item["record_bytes"]))
+            for item in elements
+        ),
     )
 
 
 def detect_camera_layout(header: PlyHeader) -> CameraLayout:
+    point_type = header.property("point_type")
+    camera_element = header.element("camera")
+    if point_type and point_type.data_type in {"uchar", "uint8"} and camera_element:
+        with header.path.open("rb") as stream:
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                def type_at(index: int) -> int:
+                    return data[header.header_bytes + index * header.record_bytes + point_type.offset]
+
+                index = 0
+                ranges: list[tuple[int, int]] = []
+                for expected_type in (0, 1, 2):
+                    start = index
+                    while index < header.vertex_count and type_at(index) == expected_type:
+                        index += 1
+                    ranges.append((start, index - start))
+
+        scene_start, scene_count = ranges[0]
+        camera_start, camera_count = ranges[1]
+        trajectory_start, trajectory_count = ranges[2]
+        if scene_start == 0 and scene_count and camera_count and index == header.vertex_count:
+            if camera_element.count <= 0 or camera_count % camera_element.count:
+                return CameraLayout.not_detected(
+                    header.vertex_count,
+                    "Camera point count is inconsistent with the camera element.",
+                )
+            samples_per_frustum = camera_count // camera_element.count
+            return CameraLayout(
+                detected=True,
+                scene_count=scene_count,
+                trajectory_start=trajectory_start,
+                trajectory_count=trajectory_count,
+                view_count=camera_element.count,
+                samples_per_frustum=samples_per_frustum,
+                runs=(CameraRun("camera_frustum", (255, 255, 255), camera_start, camera_count),),
+            )
+
     color_properties = tuple(header.property(name) for name in ("red", "green", "blue"))
     if any(item is None for item in color_properties):
         return CameraLayout.not_detected(header.vertex_count, "RGB properties are missing.")

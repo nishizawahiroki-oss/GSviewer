@@ -24,6 +24,7 @@ from view_3dgs import (
 
 
 RECORD = struct.Struct("<fffBBB")
+TYPED_RECORD = struct.Struct("<fffBBBB")
 
 
 def write_test_ply(
@@ -70,6 +71,36 @@ def write_test_ply(
         stream.write(header)
         for record in records:
             stream.write(RECORD.pack(*record))
+
+
+def write_colmap_style_test_ply(path: Path) -> None:
+    vertices = [
+        (0.0, 0.0, 0.0, 10, 20, 30, 0),
+        (1.0, 0.0, 0.0, 255, 0, 0, 1),
+        (2.0, 0.0, 0.0, 0, 255, 0, 1),
+        (3.0, 0.0, 0.0, 255, 255, 255, 2),
+    ]
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment point_type 0=scene 1=camera_frustum 2=rig_trajectory\n"
+        f"element vertex {len(vertices)}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "property uchar point_type\n"
+        "element camera 2\n"
+        "property int image_id\n"
+        "end_header\n"
+    ).encode("ascii")
+    with path.open("wb") as stream:
+        stream.write(header)
+        for vertex in vertices:
+            stream.write(TYPED_RECORD.pack(*vertex))
+        stream.write(struct.pack("<ii", 1, 2))
 
 
 class PlyInspectionTests(unittest.TestCase):
@@ -129,6 +160,20 @@ class PlyInspectionTests(unittest.TestCase):
         self.assertTrue(layout.detected)
         self.assertEqual(layout.view_count, 1)
         self.assertEqual(layout.trajectory_count, 0)
+
+    def test_detects_colmap_camera_element_with_point_type_ranges(self) -> None:
+        write_colmap_style_test_ply(self.path)
+
+        header = read_ply_header(self.path)
+        layout = detect_camera_layout(header)
+
+        self.assertEqual(header.record_bytes, 16)
+        self.assertEqual(header.element("camera").count, 2)
+        self.assertTrue(layout.detected)
+        self.assertEqual(layout.scene_count, 1)
+        self.assertEqual(layout.view_count, 2)
+        self.assertEqual(layout.samples_per_frustum, 1)
+        self.assertEqual(layout.trajectory_count, 1)
 
     def test_rejects_payload_size_mismatch(self) -> None:
         write_test_ply(self.path, scene_colors=[(10, 20, 30)])

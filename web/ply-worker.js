@@ -59,6 +59,8 @@ function parseHeader(buffer) {
   let currentElement = null;
   let vertexCount = null;
   let recordBytes = 0;
+  let cameraElementCount = 0;
+  let cameraRecordBytes = 0;
   const properties = [];
   const comments = [];
   const otherElements = [];
@@ -76,12 +78,17 @@ function parseHeader(buffer) {
       const count = Number.parseInt(parts[2], 10);
       if (!Number.isSafeInteger(count) || count < 0) fail(`Invalid element count: ${line}`);
       if (currentElement === "vertex") vertexCount = count;
+      else if (currentElement === "camera") cameraElementCount = count;
       else if (count > 0) otherElements.push(`${currentElement}=${count}`);
-    } else if (parts[0] === "property" && currentElement === "vertex") {
-      if (parts[1] === "list") fail("List properties on vertices are not supported.");
+    } else if (parts[0] === "property" && (currentElement === "vertex" || currentElement === "camera")) {
+      if (parts[1] === "list") fail("List properties are not supported.");
       if (parts.length !== 3 || !TYPE_INFO[parts[1]]) fail(`Unsupported property: ${line}`);
-      properties.push({ name: parts[2], type: parts[1], offset: recordBytes });
-      recordBytes += TYPE_INFO[parts[1]].size;
+      if (currentElement === "vertex") {
+        properties.push({ name: parts[2], type: parts[1], offset: recordBytes });
+        recordBytes += TYPE_INFO[parts[1]].size;
+      } else {
+        cameraRecordBytes += TYPE_INFO[parts[1]].size;
+      }
     }
   }
 
@@ -90,7 +97,7 @@ function parseHeader(buffer) {
   }
   if (!Number.isSafeInteger(vertexCount) || vertexCount <= 0) fail("PLY has no vertices.");
   if (otherElements.length) fail(`Additional PLY elements are not supported: ${otherElements.join(", ")}`);
-  if (headerBytes + vertexCount * recordBytes !== buffer.byteLength) {
+  if (headerBytes + vertexCount * recordBytes + cameraElementCount * cameraRecordBytes !== buffer.byteLength) {
     fail(
       `PLY size does not match its header (${buffer.byteLength.toLocaleString()} bytes received).`,
     );
@@ -100,7 +107,15 @@ function parseHeader(buffer) {
   for (const name of ["x", "y", "z"]) {
     if (!byName[name]) fail(`PLY is missing the '${name}' property.`);
   }
-  return { headerBytes, vertexCount, recordBytes, properties, byName, comments };
+  return {
+    headerBytes,
+    vertexCount,
+    recordBytes,
+    properties,
+    byName,
+    comments,
+    cameraElementCount,
+  };
 }
 
 function makePropertyReader(dataView, header, name) {
@@ -115,6 +130,43 @@ function colorsEqual(a, b) {
 }
 
 function detectCameraLayout(dataView, header) {
+  const pointType = header.byName.point_type;
+  if (pointType && ["uchar", "uint8"].includes(pointType.type) && header.cameraElementCount) {
+    const typeAt = (index) => {
+      const base = header.headerBytes + index * header.recordBytes;
+      return dataView.getUint8(base + pointType.offset);
+    };
+    let index = 0;
+    const ranges = [];
+    for (const expectedType of [0, 1, 2]) {
+      const start = index;
+      while (index < header.vertexCount && typeAt(index) === expectedType) index += 1;
+      ranges.push({ start, count: index - start });
+    }
+    const [scene, cameras, trajectory] = ranges;
+    if (scene.count && cameras.count && index === header.vertexCount) {
+      if (cameras.count % header.cameraElementCount) {
+        return {
+          detected: false,
+          sceneCount: header.vertexCount,
+          reason: "Camera point count is inconsistent with the camera element.",
+        };
+      }
+      const samplesPerFrustum = cameras.count / header.cameraElementCount;
+      return {
+        detected: true,
+        sceneCount: scene.count,
+        cameraStart: cameras.start,
+        cameraCount: cameras.count,
+        trajectoryStart: trajectory.start,
+        trajectoryCount: trajectory.count,
+        viewCount: header.cameraElementCount,
+        samplesPerFrustum,
+        runs: [{ name: "camera_frustum", color: [255, 255, 255], start: cameras.start, count: cameras.count }],
+      };
+    }
+  }
+
   const rgbProperties = [header.byName.red, header.byName.green, header.byName.blue];
   if (rgbProperties.some((property) => !property)) {
     return { detected: false, sceneCount: header.vertexCount, reason: "RGB properties are missing." };
