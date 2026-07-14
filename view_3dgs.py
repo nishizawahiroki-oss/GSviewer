@@ -346,6 +346,21 @@ def detect_camera_layout(header: PlyHeader) -> CameraLayout:
     )
 
 
+GAUSSIAN_PROPERTIES = (
+    "f_dc_0", "f_dc_1", "f_dc_2",
+    "opacity",
+    "scale_0", "scale_1", "scale_2",
+    "rot_0", "rot_1", "rot_2", "rot_3",
+)
+
+
+def is_gaussian_splat(header: PlyHeader) -> bool:
+    float_names = {
+        item.name for item in header.properties if item.data_type in {"float", "float32"}
+    }
+    return all(name in float_names for name in GAUSSIAN_PROPERTIES)
+
+
 def build_summary(header: PlyHeader, layout: CameraLayout) -> dict[str, object]:
     return {
         "file": str(header.path),
@@ -355,6 +370,7 @@ def build_summary(header: PlyHeader, layout: CameraLayout) -> dict[str, object]:
         "headerBytes": header.header_bytes,
         "vertexCount": header.vertex_count,
         "recordBytes": header.record_bytes,
+        "gaussianSplat": is_gaussian_splat(header),
         "properties": [
             {"name": item.name, "type": item.data_type, "offset": item.offset}
             for item in header.properties
@@ -400,6 +416,10 @@ class ViewerRequestHandler(BaseHTTPRequestHandler):
         "/index.html": "index.html",
         "/viewer.js": "viewer.js",
         "/ply-worker.js": "ply-worker.js",
+        "/gs": "gs.html",
+        "/gs.html": "gs.html",
+        "/gs-viewer.js": "gs-viewer.js",
+        "/gs-worker.js": "gs-worker.js",
     }
 
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib callback name
@@ -568,8 +588,13 @@ def main(argv: list[str] | None = None) -> int:
 
     actual_port = server.server_address[1]
     browser_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
-    url = f"http://{browser_host}:{actual_port}/"
-    print(f"Viewer: {url}\nStop: Ctrl+C")
+    base_url = f"http://{browser_host}:{actual_port}/"
+    if is_gaussian_splat(header):
+        url = f"{base_url}gs"
+        print(f"Gaussian renderer: {url}\nPoint viewer: {base_url}\nStop: Ctrl+C")
+    else:
+        url = base_url
+        print(f"Viewer: {url}\nStop: Ctrl+C")
     if not args.no_browser:
         threading.Timer(0.35, webbrowser.open, args=(url,)).start()
 

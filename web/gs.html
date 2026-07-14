@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>3DGS Gaussian Splat Renderer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        --panel: rgba(17, 21, 30, 0.94);
+        --panel-border: rgba(255, 255, 255, 0.1);
+        --text: #f4f7fb;
+        --muted: #99a4b7;
+        --accent: #65b8ff;
+        --danger: #ff7d7d;
+      }
+
+      * { box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+      body { background: #10131a; color: var(--text); }
+      button, input, select { font: inherit; }
+      button, .file-button, .nav-link {
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        background: #252c3a;
+        color: var(--text);
+        padding: 8px 10px;
+        cursor: pointer;
+        text-decoration: none;
+        font-size: 13px;
+      }
+      button:hover, .file-button:hover, .nav-link:hover { background: #30394a; }
+      button:focus-visible, input:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      #viewport { display: block; width: 100%; height: 100%; touch-action: none; background: #10131a; }
+
+      .topbar {
+        position: fixed;
+        inset: 14px 14px auto 14px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 52px;
+        padding: 10px 12px;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+        box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
+        z-index: 3;
+      }
+      .brand { min-width: 0; flex: 1; }
+      .brand h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.01em; }
+      .brand p {
+        margin: 3px 0 0;
+        max-width: 52vw;
+        overflow: hidden;
+        color: var(--muted);
+        font-size: 12px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #file-input { display: none; }
+
+      .panel {
+        position: fixed;
+        top: 80px;
+        right: 14px;
+        width: min(310px, calc(100vw - 28px));
+        max-height: calc(100vh - 94px);
+        overflow: auto;
+        padding: 14px;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+        box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
+        z-index: 2;
+      }
+      .section + .section { border-top: 1px solid var(--panel-border); margin-top: 14px; padding-top: 14px; }
+      .section-title {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .stats { display: grid; grid-template-columns: 1fr auto; gap: 7px 12px; font-size: 12px; }
+      .stats span:nth-child(odd) { color: var(--muted); }
+      .stats span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+      .control { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; margin: 9px 0; font-size: 13px; }
+      .control input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+      .control input[type="color"] { width: 44px; height: 28px; padding: 1px; border: 0; background: transparent; }
+      .button-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+      .help { color: var(--muted); font-size: 11px; line-height: 1.65; }
+      .help strong { color: var(--text); font-weight: 600; }
+
+      .gpu-badge {
+        position: fixed;
+        left: 14px;
+        bottom: 14px;
+        max-width: calc(100vw - 352px);
+        overflow: hidden;
+        padding: 7px 10px;
+        border: 1px solid var(--panel-border);
+        border-radius: 9px;
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        z-index: 2;
+      }
+      .gpu-badge::before { content: "●"; color: #62dda1; margin-right: 7px; }
+
+      .loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .loading-card {
+        width: min(390px, calc(100vw - 40px));
+        padding: 18px;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        background: var(--panel);
+        box-shadow: 0 16px 50px rgba(0, 0, 0, 0.35);
+      }
+      .loading-card p { margin: 0 0 11px; font-size: 13px; }
+      .progress-track { height: 5px; overflow: hidden; border-radius: 3px; background: #303747; }
+      #progress-bar { width: 0; height: 100%; border-radius: 3px; background: var(--accent); transition: width 120ms linear; }
+      #progress-detail { margin: 8px 0 0; color: var(--muted); font-size: 11px; }
+      .hidden { display: none !important; }
+      #error-box { color: var(--danger); line-height: 1.5; }
+
+      @media (max-width: 720px) {
+        .topbar { inset: 8px 8px auto 8px; }
+        .panel { top: auto; right: 8px; bottom: 8px; width: calc(100vw - 16px); max-height: 44vh; }
+        .gpu-badge { left: 8px; bottom: calc(44vh + 17px); max-width: calc(100vw - 16px); }
+        .brand p { max-width: 40vw; }
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="viewport" aria-label="3D gaussian splatting viewport"></canvas>
+
+    <header class="topbar">
+      <div class="brand">
+        <h1>3DGS Gaussian Splat Renderer</h1>
+        <p id="file-name">PLY を読み込んでいます…</p>
+      </div>
+      <a class="nav-link" href="/">点群表示</a>
+      <label class="file-button" for="file-input">別の PLY</label>
+      <input id="file-input" type="file" accept=".ply,application/octet-stream" />
+    </header>
+
+    <aside class="panel">
+      <section class="section">
+        <h2 class="section-title">Data</h2>
+        <div class="stats">
+          <span>ガウシアン数</span><span id="splat-count">—</span>
+          <span>ファイル</span><span id="file-size">—</span>
+          <span>深度ソート</span><span id="sort-time">—</span>
+          <span>FPS</span><span id="fps">—</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title">Appearance</h2>
+        <label class="control">
+          <span>スプラットスケール</span><output id="splat-scale-value">1.00×</output>
+          <input id="splat-scale" type="range" min="0.05" max="2" step="0.05" value="1" aria-label="スプラットスケール" />
+        </label>
+        <label class="control">
+          <span>不透明度しきい値</span><output id="alpha-threshold-value">0.00</output>
+          <input id="alpha-threshold" type="range" min="0" max="1" step="0.01" value="0" aria-label="不透明度しきい値" />
+        </label>
+        <label class="control"><span>Z 反転</span><input id="flip-z" type="checkbox" /></label>
+        <label class="control"><span>背景色</span><input id="background" type="color" value="#10131a" /></label>
+      </section>
+
+      <section class="section">
+        <h2 class="section-title">View</h2>
+        <div class="button-row">
+          <button id="fit-scene" type="button">シーンに合わせる</button>
+        </div>
+      </section>
+
+      <section class="section help">
+        異方性楕円 + 不透明度の front-to-back 合成で描画します。
+        色は SH の DC 項（視点依存の高次 SH は未適用）。<br />
+        <strong>回転</strong> 左ドラッグ　<strong>移動</strong> 右ドラッグ / Shift+左ドラッグ<br />
+        <strong>ズーム</strong> ホイール / トラックパッド　<strong>リセット</strong> ダブルクリック
+      </section>
+    </aside>
+
+    <div id="gpu-info" class="gpu-badge">WebGL2 GPU を確認中…</div>
+
+    <div id="loading" class="loading">
+      <div class="loading-card">
+        <p id="progress-label">3DGS PLY を読み込んでいます</p>
+        <div class="progress-track"><div id="progress-bar"></div></div>
+        <p id="progress-detail">準備中…</p>
+      </div>
+    </div>
+
+    <div id="error-overlay" class="loading hidden">
+      <div class="loading-card">
+        <p id="error-box"></p>
+      </div>
+    </div>
+
+    <script src="/gs-viewer.js" defer></script>
+  </body>
+</html>

@@ -18,6 +18,7 @@ from view_3dgs import (
     ViewerServer,
     build_summary,
     detect_camera_layout,
+    is_gaussian_splat,
     parse_args,
     read_ply_header,
 )
@@ -103,6 +104,29 @@ def write_colmap_style_test_ply(path: Path) -> None:
         stream.write(struct.pack("<ii", 1, 2))
 
 
+def write_gaussian_test_ply(path: Path, count: int = 3) -> None:
+    property_names = (
+        ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"]
+        + [f"f_rest_{index}" for index in range(45)]
+        + ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+    )
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {count}\n"
+        + "".join(f"property float {name}\n" for name in property_names)
+        + "end_header\n"
+    ).encode("ascii")
+    record = struct.Struct(f"<{len(property_names)}f")
+    with path.open("wb") as stream:
+        stream.write(header)
+        for index in range(count):
+            values = [0.0] * len(property_names)
+            values[0] = float(index)
+            values[-4] = 1.0  # rot_0 = w
+            stream.write(record.pack(*values))
+
+
 class PlyInspectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -182,6 +206,24 @@ class PlyInspectionTests(unittest.TestCase):
         with self.assertRaisesRegex(PlyError, "size mismatch"):
             read_ply_header(self.path)
 
+    def test_detects_full_gaussian_splat_ply(self) -> None:
+        write_gaussian_test_ply(self.path)
+
+        header = read_ply_header(self.path)
+
+        self.assertTrue(is_gaussian_splat(header))
+        summary = build_summary(header, detect_camera_layout(header))
+        self.assertTrue(summary["gaussianSplat"])
+
+    def test_plain_rgb_ply_is_not_a_gaussian_splat(self) -> None:
+        write_test_ply(self.path, scene_colors=[(10, 20, 30)])
+
+        header = read_ply_header(self.path)
+
+        self.assertFalse(is_gaussian_splat(header))
+        summary = build_summary(header, detect_camera_layout(header))
+        self.assertFalse(summary["gaussianSplat"])
+
     def test_rejects_invalid_port_before_server_start(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -249,6 +291,16 @@ class HttpServerTests(unittest.TestCase):
         with urllib.request.urlopen(f"{self.base_url}/") as response:
             html = response.read().decode("utf-8")
         self.assertIn("3DGS + Training Cameras", html)
+
+    def test_serves_gaussian_renderer_assets(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/gs") as response:
+            html = response.read().decode("utf-8")
+        self.assertIn("3DGS Gaussian Splat Renderer", html)
+
+        for asset in ("/gs-viewer.js", "/gs-worker.js"):
+            with urllib.request.urlopen(f"{self.base_url}{asset}") as response:
+                self.assertEqual(response.status, 200)
+                self.assertTrue(response.read())
 
 
 if __name__ == "__main__":

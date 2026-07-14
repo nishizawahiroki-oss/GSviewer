@@ -94,7 +94,41 @@ uchar red, green, blue
 
 元の Gaussian にあったはずの `scale`、`rotation`、`opacity`、高次 SH 係数は保存されていません。そのため、異方性楕円・半透明合成・視点依存色を使う「本来の Gaussian rasterization」は復元できません。このビューアーでは、保存されている Gaussian 中心を色付きの丸いスクリーン空間スプラットとして描きます。
 
-CUDA 版 Gaussian rasterizer を使わない理由も、この属性不足です。完全な 3DGS PLY（scale / rotation / opacity / SH を含む）が用意できる場合は、別の Gaussian rasterizer 経路を追加できます。
+完全な 3DGS PLY（scale / rotation / opacity / SH を含む）に対しては、次節の Gaussian レンダラー経路が使えます。
+
+## Gaussian レンダラー (`/gs`)
+
+完全な 3DGS PLY（`f_dc_0..2` / `opacity` / `scale_0..2` / `rot_0..3` を持つ、
+INRIA 3DGS 学習出力の `point_cloud.ply` 形式）を渡すと自動検出し、
+ブラウザは `http://127.0.0.1:8000/gs` の Gaussian レンダラーで開きます。
+
+```bash
+python3 view_3dgs.py /path/to/point_cloud.ply
+```
+
+描画内容:
+
+- 3D 共分散 Σ = R S² Rᵀ を EWA スプラッティングで 2D 射影した異方性楕円
+- sigmoid(opacity) を使った front-to-back の半透明合成（深度は worker のカウンティングソート）
+- SH DC 項からの色（視点依存の高次 SH 係数は未適用）
+- `filter_3D` プロパティがある場合は Mip-Splatting の 3D フィルタ補正を適用
+- 1.4 GB / 500 万ガウシアン級を WebGL2 テクスチャ 1 枚 + インスタンス描画で表示
+
+右パネルで次を調整できます。
+
+- スプラットスケール（楕円の倍率。0.05× にすると点群相当の表示になり形状確認に便利）
+- 不透明度しきい値（低 opacity のフローターを間引く。動画学習由来のもや対策）
+- Z 反転（COLMAP 系の座標で上下・裏表が逆に見えるときのミラー表示）
+- 背景色
+
+注意: 動画から学習した 3DGS は、学習カメラ軌跡から離れた視点では
+巨大な半透明ガウシアンにより霧がかかったように見えます。これはデータ由来で、
+学習視点付近（シーン内部）では正しく写実的に描画されます。
+
+パーサーは頂点 stride をヘッダーから決めるストリーミング実装のため、
+`nx/ny/nz` や `f_rest_*`、`gaussian_features_*` など追加の float プロパティが
+混在していても読めます。`red/green/blue`(uchar) しか持たない PLY を `/gs` で
+開いた場合は、その色を使って等方点として描画します。
 
 ## カメラの自動分離
 
@@ -190,8 +224,11 @@ python3 view_3dgs.py /path/to/file.ply --port 0
 
 ```text
 view_3dgs.py       PLY 検証とローカル HTTP サーバー
-web/index.html     ビューアー UI
-web/viewer.js      WebGL2 描画と操作
-web/ply-worker.js  バックグラウンド PLY 解析
+web/index.html     点群ビューアー UI
+web/viewer.js      WebGL2 点描画と操作
+web/ply-worker.js  バックグラウンド PLY 解析（点群用）
+web/gs.html        Gaussian レンダラー UI (/gs)
+web/gs-viewer.js   WebGL2 EWA ガウシアンスプラッティング描画
+web/gs-worker.js   3DGS PLY ストリーミング解析と深度ソート
 tests/             PLY 分離・HTTP 配信のテスト
 ```
