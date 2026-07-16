@@ -62,6 +62,7 @@ function parseHeader(buffer) {
   let cameraElementCount = 0;
   let cameraRecordBytes = 0;
   const properties = [];
+  const cameraProperties = [];
   const comments = [];
   const otherElements = [];
 
@@ -87,6 +88,7 @@ function parseHeader(buffer) {
         properties.push({ name: parts[2], type: parts[1], offset: recordBytes });
         recordBytes += TYPE_INFO[parts[1]].size;
       } else {
+        cameraProperties.push({ name: parts[2], type: parts[1], offset: cameraRecordBytes });
         cameraRecordBytes += TYPE_INFO[parts[1]].size;
       }
     }
@@ -115,6 +117,8 @@ function parseHeader(buffer) {
     byName,
     comments,
     cameraElementCount,
+    cameraRecordBytes,
+    cameraProperties,
   };
 }
 
@@ -314,6 +318,137 @@ function robustBounds(positions, count) {
   };
 }
 
+const FRUSTUM_FACE_COLORS = [
+  [26, 140, 255], // face 0: front (blue)
+  [255, 77, 56], // face 1: right (red)
+  [115, 217, 64], // face 2: back (green)
+  [255, 196, 32], // face 3: left (yellow)
+  [190, 90, 255], // face 4: up (purple)
+  [25, 217, 199], // face 5: down (cyan)
+];
+
+const FRUSTUM_REQUIRED = [
+  "center_x", "center_y", "center_z",
+  "world_from_camera_r00", "world_from_camera_r01", "world_from_camera_r02",
+  "world_from_camera_r10", "world_from_camera_r11", "world_from_camera_r12",
+  "world_from_camera_r20", "world_from_camera_r21", "world_from_camera_r22",
+  "fx", "fy", "cx", "cy", "width", "height",
+];
+
+// Rebuild exact camera frusta as solid line segments from the PLY's camera
+// element (COLMAP convention: camera +X right, +Y down, +Z forward).
+function buildCameraFrustums(dataView, header) {
+  if (!header.cameraElementCount || !header.cameraRecordBytes) return null;
+  const byName = Object.fromEntries(
+    header.cameraProperties.map((property) => [property.name, property]),
+  );
+  if (FRUSTUM_REQUIRED.some((name) => !byName[name])) return null;
+
+  const count = header.cameraElementCount;
+  const elementBase = header.headerBytes + header.vertexCount * header.recordBytes;
+  const readers = Object.fromEntries(
+    Object.entries(byName).map(([name, property]) => [
+      name,
+      (cameraIndex) => TYPE_INFO[property.type].read(
+        dataView,
+        elementBase + cameraIndex * header.cameraRecordBytes + property.offset,
+      ),
+    ]),
+  );
+
+  const centers = new Float64Array(count * 3);
+  for (let index = 0; index < count; index += 1) {
+    centers[index * 3] = readers.center_x(index);
+    centers[index * 3 + 1] = readers.center_y(index);
+    centers[index * 3 + 2] = readers.center_z(index);
+  }
+
+  // Frustum depth: median spacing between consecutive distinct camera centers
+  // (multi-face rigs repeat the same center, so skip near-zero steps).
+  const spacings = [];
+  for (let index = 1; index < count; index += 1) {
+    const distance = Math.hypot(
+      centers[index * 3] - centers[(index - 1) * 3],
+      centers[index * 3 + 1] - centers[(index - 1) * 3 + 1],
+      centers[index * 3 + 2] - centers[(index - 1) * 3 + 2],
+    );
+    if (distance > 1e-9) spacings.push(distance);
+  }
+  spacings.sort((a, b) => a - b);
+  let depth = spacings.length ? spacings[Math.floor(spacings.length / 2)] * 1.2 : 0;
+  if (!(depth > 0)) {
+    let minX = Infinity; let minY = Infinity; let minZ = Infinity;
+    let maxX = -Infinity; let maxY = -Infinity; let maxZ = -Infinity;
+    for (let index = 0; index < count; index += 1) {
+      minX = Math.min(minX, centers[index * 3]); maxX = Math.max(maxX, centers[index * 3]);
+      minY = Math.min(minY, centers[index * 3 + 1]); maxY = Math.max(maxY, centers[index * 3 + 1]);
+      minZ = Math.min(minZ, centers[index * 3 + 2]); maxZ = Math.max(maxZ, centers[index * 3 + 2]);
+    }
+    depth = Math.max(1e-3, Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) * 0.05);
+  }
+
+  // 8 solid segments per camera: 4 center->corner rays + 4 far-plane edges.
+  const VERTICES_PER_CAMERA = 16;
+  const positions = new Float32Array(count * VERTICES_PER_CAMERA * 3);
+  const colors = new Uint8Array(count * VERTICES_PER_CAMERA * 3);
+  const faceReader = byName.face_id ? readers.face_id : null;
+  const corner = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+
+  for (let index = 0; index < count; index += 1) {
+    const cx = readers.cx(index);
+    const cy = readers.cy(index);
+    const fx = readers.fx(index);
+    const fy = readers.fy(index);
+    const width = readers.width(index);
+    const height = readers.height(index);
+    const rotation = [
+      readers.world_from_camera_r00(index), readers.world_from_camera_r01(index), readers.world_from_camera_r02(index),
+      readers.world_from_camera_r10(index), readers.world_from_camera_r11(index), readers.world_from_camera_r12(index),
+      readers.world_from_camera_r20(index), readers.world_from_camera_r21(index), readers.world_from_camera_r22(index),
+    ];
+    const centerX = centers[index * 3];
+    const centerY = centers[index * 3 + 1];
+    const centerZ = centers[index * 3 + 2];
+
+    const pixelCorners = [[0, 0], [width, 0], [width, height], [0, height]];
+    for (let cornerIndex = 0; cornerIndex < 4; cornerIndex += 1) {
+      const [u, v] = pixelCorners[cornerIndex];
+      const dirX = ((u - cx) / fx) * depth;
+      const dirY = ((v - cy) / fy) * depth;
+      const dirZ = depth;
+      corner[cornerIndex][0] = centerX + rotation[0] * dirX + rotation[1] * dirY + rotation[2] * dirZ;
+      corner[cornerIndex][1] = centerY + rotation[3] * dirX + rotation[4] * dirY + rotation[5] * dirZ;
+      corner[cornerIndex][2] = centerZ + rotation[6] * dirX + rotation[7] * dirY + rotation[8] * dirZ;
+    }
+
+    const color = faceReader
+      ? FRUSTUM_FACE_COLORS[faceReader(index) % FRUSTUM_FACE_COLORS.length]
+      : [255, 255, 255];
+    const segments = [
+      [centerX, centerY, centerZ], corner[0],
+      [centerX, centerY, centerZ], corner[1],
+      [centerX, centerY, centerZ], corner[2],
+      [centerX, centerY, centerZ], corner[3],
+      corner[0], corner[1],
+      corner[1], corner[2],
+      corner[2], corner[3],
+      corner[3], corner[0],
+    ];
+    const vertexBase = index * VERTICES_PER_CAMERA;
+    for (let vertexIndex = 0; vertexIndex < VERTICES_PER_CAMERA; vertexIndex += 1) {
+      const outOffset = (vertexBase + vertexIndex) * 3;
+      positions[outOffset] = segments[vertexIndex][0];
+      positions[outOffset + 1] = segments[vertexIndex][1];
+      positions[outOffset + 2] = segments[vertexIndex][2];
+      colors[outOffset] = color[0];
+      colors[outOffset + 1] = color[1];
+      colors[outOffset + 2] = color[2];
+    }
+  }
+
+  return { positions, colors, count, verticesPerCamera: VERTICES_PER_CAMERA };
+}
+
 function parsePly(buffer, fileName) {
   const dataView = new DataView(buffer);
   const header = parseHeader(buffer);
@@ -363,9 +498,12 @@ function parsePly(buffer, fileName) {
       : null,
   };
 
+  const frustums = buildCameraFrustums(dataView, header);
+
   return {
     positions,
     colors,
+    frustums,
     metadata: {
       fileName,
       fileBytes: buffer.byteLength,
@@ -374,6 +512,9 @@ function parsePly(buffer, fileName) {
       comments: header.comments,
       layout,
       bounds,
+      frustum: frustums
+        ? { count: frustums.count, verticesPerCamera: frustums.verticesPerCamera }
+        : null,
     },
   };
 }
@@ -382,14 +523,20 @@ self.onmessage = (event) => {
   if (event.data?.type !== "parse" || !(event.data.buffer instanceof ArrayBuffer)) return;
   try {
     const result = parsePly(event.data.buffer, event.data.fileName || "pointcloud.ply");
+    const transfers = [result.positions.buffer, result.colors.buffer];
+    if (result.frustums) {
+      transfers.push(result.frustums.positions.buffer, result.frustums.colors.buffer);
+    }
     self.postMessage(
       {
         type: "result",
         positions: result.positions.buffer,
         colors: result.colors.buffer,
+        frustumPositions: result.frustums ? result.frustums.positions.buffer : null,
+        frustumColors: result.frustums ? result.frustums.colors.buffer : null,
         metadata: result.metadata,
       },
-      [result.positions.buffer, result.colors.buffer],
+      transfers,
     );
   } catch (error) {
     self.postMessage({

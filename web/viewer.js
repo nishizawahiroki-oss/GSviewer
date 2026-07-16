@@ -123,6 +123,8 @@ const uniforms = {
 
 let positionBuffer = null;
 let colorBuffer = null;
+let frustumPositionBuffer = null;
+let frustumColorBuffer = null;
 let metadata = null;
 let activeWorker = null;
 let loadGeneration = 0;
@@ -339,6 +341,15 @@ function bindGeometry() {
   gl.vertexAttribPointer(1, 3, gl.UNSIGNED_BYTE, true, 0, 0);
 }
 
+function bindFrustumGeometry() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, frustumPositionBuffer);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, frustumColorBuffer);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.UNSIGNED_BYTE, true, 0, 0);
+}
+
 function drawPoints(start, count, size) {
   if (count <= 0) return;
   gl.uniform1f(uniforms.pointSize, size * Math.min(window.devicePixelRatio || 1, 2));
@@ -388,7 +399,18 @@ function render() {
 
   if (layout.detected && ui["show-cameras"].checked) {
     const selected = Number.parseInt(ui["camera-index"].value, 10);
-    if (selected < 0) {
+    const frustum = metadata.frustum;
+    if (frustum && frustumPositionBuffer && frustumColorBuffer) {
+      // Exact frusta rebuilt from the PLY camera element, drawn as solid lines.
+      bindFrustumGeometry();
+      gl.uniform1f(uniforms.roundPoint, 0);
+      if (selected < 0) {
+        gl.drawArrays(gl.LINES, 0, frustum.count * frustum.verticesPerCamera);
+      } else {
+        gl.drawArrays(gl.LINES, selected * frustum.verticesPerCamera, frustum.verticesPerCamera);
+      }
+      bindGeometry();
+    } else if (selected < 0) {
       drawPoints(layout.cameraStart, layout.cameraCount, Number.parseFloat(ui["camera-size"].value));
     } else {
       for (const run of layout.runs) {
@@ -412,43 +434,53 @@ function render() {
   gl.enable(gl.DEPTH_TEST);
 }
 
-function uploadGeometry(positionsBuffer, colorsBuffer, nextMetadata) {
+function uploadGeometry(positionsBuffer, colorsBuffer, frustumPositions, frustumColors, nextMetadata) {
   setProgress(0.96, "GPU に転送しています", "点群バッファを作成中…");
+  const hasFrustums = Boolean(nextMetadata.frustum && frustumPositions && frustumColors);
   const nextPositionBuffer = gl.createBuffer();
   const nextColorBuffer = gl.createBuffer();
-  if (!nextPositionBuffer || !nextColorBuffer) {
-    if (nextPositionBuffer) gl.deleteBuffer(nextPositionBuffer);
-    if (nextColorBuffer) gl.deleteBuffer(nextColorBuffer);
+  const nextFrustumPositionBuffer = hasFrustums ? gl.createBuffer() : null;
+  const nextFrustumColorBuffer = hasFrustums ? gl.createBuffer() : null;
+  const nextBuffers = [
+    nextPositionBuffer, nextColorBuffer, nextFrustumPositionBuffer, nextFrustumColorBuffer,
+  ];
+  if (!nextPositionBuffer || !nextColorBuffer
+    || (hasFrustums && (!nextFrustumPositionBuffer || !nextFrustumColorBuffer))) {
+    for (const buffer of nextBuffers) if (buffer) gl.deleteBuffer(buffer);
     throw new Error("GPU buffer allocation failed. The WebGL context may be unavailable.");
   }
 
   try {
-    gl.bindBuffer(gl.ARRAY_BUFFER, nextPositionBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positionsBuffer), gl.STATIC_DRAW);
-    let uploadError = gl.getError();
-    if (uploadError !== gl.NO_ERROR) {
-      throw new Error(`Position upload failed (WebGL error 0x${uploadError.toString(16)}).`);
+    const uploads = [
+      [nextPositionBuffer, new Float32Array(positionsBuffer), "Position"],
+      [nextColorBuffer, new Uint8Array(colorsBuffer), "Color"],
+    ];
+    if (hasFrustums) {
+      uploads.push(
+        [nextFrustumPositionBuffer, new Float32Array(frustumPositions), "Frustum position"],
+        [nextFrustumColorBuffer, new Uint8Array(frustumColors), "Frustum color"],
+      );
     }
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, nextColorBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(colorsBuffer), gl.STATIC_DRAW);
-    uploadError = gl.getError();
-    if (uploadError !== gl.NO_ERROR) {
-      throw new Error(`Color upload failed (WebGL error 0x${uploadError.toString(16)}).`);
+    for (const [buffer, data, label] of uploads) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      const uploadError = gl.getError();
+      if (uploadError !== gl.NO_ERROR) {
+        throw new Error(`${label} upload failed (WebGL error 0x${uploadError.toString(16)}).`);
+      }
     }
   } catch (error) {
-    gl.deleteBuffer(nextPositionBuffer);
-    gl.deleteBuffer(nextColorBuffer);
+    for (const buffer of nextBuffers) if (buffer) gl.deleteBuffer(buffer);
     throw error;
   }
 
-  const previousPositionBuffer = positionBuffer;
-  const previousColorBuffer = colorBuffer;
+  const previousBuffers = [positionBuffer, colorBuffer, frustumPositionBuffer, frustumColorBuffer];
   positionBuffer = nextPositionBuffer;
   colorBuffer = nextColorBuffer;
+  frustumPositionBuffer = nextFrustumPositionBuffer;
+  frustumColorBuffer = nextFrustumColorBuffer;
   metadata = nextMetadata;
-  if (previousPositionBuffer) gl.deleteBuffer(previousPositionBuffer);
-  if (previousColorBuffer) gl.deleteBuffer(previousColorBuffer);
+  for (const buffer of previousBuffers) if (buffer) gl.deleteBuffer(buffer);
   orbit.fullRadius = boundsRadius(metadata.bounds.all);
   updateDataUi();
   fitBounds(metadata.bounds.sceneRobust || metadata.bounds.scene || metadata.bounds.all, "scene");
@@ -527,7 +559,13 @@ function parseInWorker(buffer, fileName, generation) {
       );
     } else if (event.data.type === "result") {
       try {
-        uploadGeometry(event.data.positions, event.data.colors, event.data.metadata);
+        uploadGeometry(
+          event.data.positions,
+          event.data.colors,
+          event.data.frustumPositions,
+          event.data.frustumColors,
+          event.data.metadata,
+        );
         worker.terminate();
         if (activeWorker === worker) activeWorker = null;
       } catch (error) {
