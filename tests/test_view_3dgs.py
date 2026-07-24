@@ -13,14 +13,21 @@ from pathlib import Path
 
 from view_3dgs import (
     CAMERA_RUNS,
+    LIGHT_SOURCES_NAME,
+    MESH_PACKAGE_PLY_NAME,
+    PACKAGE_PLY_NAME,
     TRAJECTORY_COLOR,
+    LightPackageError,
     PlyError,
     ViewerServer,
     build_summary,
     detect_camera_layout,
+    gaussian_splat_kind,
     is_gaussian_splat,
     parse_args,
+    read_light_sources,
     read_ply_header,
+    resolve_input_path,
 )
 
 
@@ -104,11 +111,15 @@ def write_colmap_style_test_ply(path: Path) -> None:
         stream.write(struct.pack("<ii", 1, 2))
 
 
-def write_gaussian_test_ply(path: Path, count: int = 3) -> None:
+def write_gaussian_test_ply(path: Path, count: int = 3, *, dimensions: int = 3) -> None:
+    if dimensions not in {2, 3}:
+        raise ValueError("dimensions must be 2 or 3")
     property_names = (
         ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"]
         + [f"f_rest_{index}" for index in range(45)]
-        + ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+        + ["opacity", "scale_0", "scale_1"]
+        + (["scale_2"] if dimensions == 3 else [])
+        + ["rot_0", "rot_1", "rot_2", "rot_3"]
     )
     header = (
         "ply\n"
@@ -125,6 +136,105 @@ def write_gaussian_test_ply(path: Path, count: int = 3) -> None:
             values[0] = float(index)
             values[-4] = 1.0  # rot_0 = w
             stream.write(record.pack(*values))
+
+
+def write_mesh_test_ply(path: Path) -> None:
+    vertices = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+    ]
+    faces = [(0, 1, 2)]
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment Created by Open3D\n"
+        f"element vertex {len(vertices)}\n"
+        "property double x\n"
+        "property double y\n"
+        "property double z\n"
+        f"element face {len(faces)}\n"
+        "property list uchar uint vertex_indices\n"
+        "end_header\n"
+    ).encode("ascii")
+    with path.open("wb") as stream:
+        stream.write(header)
+        for vertex in vertices:
+            stream.write(struct.pack("<ddd", *vertex))
+        for face in faces:
+            stream.write(struct.pack("<BIII", len(face), *face))
+
+
+def write_light_sources(path: Path, scene_vertex_count: int) -> dict[str, object]:
+    registry = {
+        "schema_version": 1,
+        "status": "prototype_visual_proxy_only",
+        "counts": {
+            "background_ply_vertex_count": scene_vertex_count,
+            "parametric_proxy_gaussian_count": 2,
+        },
+        "fixtures": [
+            {
+                "fixture_id": "fixture_0001",
+                "specification": {"fixture_type": "linear_batten"},
+                "parametric_proxy": {
+                    "proxy_count": 2,
+                    "position_world": [1.0, 2.0, 3.0],
+                    "extent_98_percent_world_units": [2.0, 0.5, 0.1],
+                    "rotation_world_from_proxy": [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "base_emission_srgb_power_1": [1.0, 0.8, 0.6],
+                    "relative_intensity_0_1": 0.5,
+                },
+            }
+        ],
+    }
+    path.write_text(json.dumps(registry), encoding="utf-8")
+    return registry
+
+
+def write_finite_emitters(path: Path) -> dict[str, object]:
+    registry = {
+        "schema_version": 1,
+        "registry_type": "finite_area_emitters_relative",
+        "scale_status": "relative_gw_world_units",
+        "counts": {
+            "emitter_count": 2,
+            "sample_count": 1,
+            "source_fixture_count": 2,
+        },
+        "emitters": [
+            {
+                "emitter_id": "emitter_0001",
+                "enabled": True,
+                "center_world": [1.0, 2.0, 3.0],
+                "normal_world": [0.0, 1.0, 0.0],
+                "relative_area_world2": 2.0,
+                "relative_flux_rgb_initial": [1.0, 0.8, 0.6],
+                "samples": [
+                    {
+                        "position_world": [1.0, 2.0, 3.0],
+                        "normal_world": [0.0, 1.0, 0.0],
+                        "area_weight_world2": 2.0,
+                    }
+                ],
+            },
+            {
+                "emitter_id": "emitter_0002",
+                "enabled": False,
+                "center_world": None,
+                "normal_world": None,
+                "relative_area_world2": None,
+                "relative_flux_rgb_initial": None,
+                "samples": [],
+            },
+        ],
+    }
+    path.write_text(json.dumps(registry), encoding="utf-8")
+    return registry
 
 
 class PlyInspectionTests(unittest.TestCase):
@@ -212,8 +322,33 @@ class PlyInspectionTests(unittest.TestCase):
         header = read_ply_header(self.path)
 
         self.assertTrue(is_gaussian_splat(header))
+        self.assertEqual(gaussian_splat_kind(header), "3DGS")
         summary = build_summary(header, detect_camera_layout(header))
         self.assertTrue(summary["gaussianSplat"])
+        self.assertEqual(summary["gaussianKind"], "3DGS")
+
+    def test_detects_2d_gaussian_splat_without_scale_2(self) -> None:
+        write_gaussian_test_ply(self.path, dimensions=2)
+
+        header = read_ply_header(self.path)
+
+        self.assertTrue(is_gaussian_splat(header))
+        self.assertEqual(gaussian_splat_kind(header), "2DGS")
+        summary = build_summary(header, detect_camera_layout(header))
+        self.assertTrue(summary["gaussianSplat"])
+        self.assertEqual(summary["gaussianKind"], "2DGS")
+
+    def test_detects_artifixer3d_from_export_name(self) -> None:
+        path = Path(self.temporary.name) / "artifixer3d.ply"
+        write_gaussian_test_ply(path, dimensions=3)
+
+        header = read_ply_header(path)
+
+        self.assertEqual(gaussian_splat_kind(header), "ArtiFixer3D")
+        self.assertEqual(
+            build_summary(header, detect_camera_layout(header))["gaussianKind"],
+            "ArtiFixer3D",
+        )
 
     def test_plain_rgb_ply_is_not_a_gaussian_splat(self) -> None:
         write_test_ply(self.path, scene_colors=[(10, 20, 30)])
@@ -221,13 +356,71 @@ class PlyInspectionTests(unittest.TestCase):
         header = read_ply_header(self.path)
 
         self.assertFalse(is_gaussian_splat(header))
+        self.assertIsNone(gaussian_splat_kind(header))
         summary = build_summary(header, detect_camera_layout(header))
         self.assertFalse(summary["gaussianSplat"])
+        self.assertIsNone(summary["gaussianKind"])
+
+    def test_reads_open3d_mesh_ply_with_face_list(self) -> None:
+        write_mesh_test_ply(self.path)
+
+        header = read_ply_header(self.path)
+        summary = build_summary(header, detect_camera_layout(header))
+
+        self.assertEqual(header.vertex_count, 3)
+        self.assertEqual(header.record_bytes, 24)
+        self.assertEqual(header.element("face").count, 1)
+        self.assertEqual(summary["mesh"], {"available": True, "faceCount": 1})
 
     def test_rejects_invalid_port_before_server_start(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--port", "-1"])
+
+    def test_resolves_and_validates_light_package_directory(self) -> None:
+        package = Path(self.temporary.name) / "package"
+        package.mkdir()
+        ply_path = package / PACKAGE_PLY_NAME
+        light_path = package / LIGHT_SOURCES_NAME
+        write_gaussian_test_ply(ply_path, count=3)
+        write_light_sources(light_path, scene_vertex_count=3)
+
+        resolved_ply, resolved_lights = resolve_input_path(package)
+        registry = read_light_sources(resolved_lights, scene_vertex_count=3)
+        summary = build_summary(
+            read_ply_header(resolved_ply),
+            detect_camera_layout(read_ply_header(resolved_ply)),
+            registry,
+        )
+
+        self.assertEqual(resolved_ply, ply_path.resolve())
+        self.assertEqual(resolved_lights, light_path.resolve())
+        self.assertEqual(summary["lightPackage"]["fixtureCount"], 1)
+        self.assertEqual(summary["lightPackage"]["proxyCount"], 2)
+
+    def test_resolves_mesh_and_finite_emitter_package_directory(self) -> None:
+        package = Path(self.temporary.name) / "mesh-package"
+        package.mkdir()
+        ply_path = package / MESH_PACKAGE_PLY_NAME
+        light_path = package / LIGHT_SOURCES_NAME
+        write_mesh_test_ply(ply_path)
+        write_finite_emitters(light_path)
+
+        resolved_ply, resolved_lights = resolve_input_path(package)
+        header = read_ply_header(resolved_ply)
+        registry = read_light_sources(resolved_lights, scene_vertex_count=header.vertex_count)
+        summary = build_summary(header, detect_camera_layout(header), registry)
+
+        self.assertEqual(resolved_ply, ply_path.resolve())
+        self.assertEqual(resolved_lights, light_path.resolve())
+        self.assertEqual(summary["lightPackage"]["emitterCount"], 2)
+        self.assertEqual(summary["lightPackage"]["sampleCount"], 1)
+
+    def test_rejects_light_registry_for_a_different_background_ply(self) -> None:
+        light_path = Path(self.temporary.name) / LIGHT_SOURCES_NAME
+        write_light_sources(light_path, scene_vertex_count=99)
+        with self.assertRaisesRegex(LightPackageError, "does not match"):
+            read_light_sources(light_path, scene_vertex_count=3)
 
 
 class HttpServerTests(unittest.TestCase):
@@ -237,8 +430,10 @@ class HttpServerTests(unittest.TestCase):
         self.path = Path(self.temporary.name) / "served.ply"
         write_test_ply(self.path, scene_colors=[(10, 20, 30)], camera_views=2)
         header = read_ply_header(self.path)
-        self.summary = build_summary(header, detect_camera_layout(header))
-        self.server = ViewerServer(("127.0.0.1", 0), self.summary)
+        self.light_path = Path(self.temporary.name) / LIGHT_SOURCES_NAME
+        registry = write_light_sources(self.light_path, scene_vertex_count=header.vertex_count)
+        self.summary = build_summary(header, detect_camera_layout(header), registry)
+        self.server = ViewerServer(("127.0.0.1", 0), self.summary, self.light_path)
         self.server.quiet = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -292,10 +487,15 @@ class HttpServerTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertIn("3DGS + Training Cameras", html)
 
+    def test_serves_light_registry(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/light-sources.json") as response:
+            registry = json.load(response)
+        self.assertEqual(registry["fixtures"][0]["fixture_id"], "fixture_0001")
+
     def test_serves_gaussian_renderer_assets(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/gs") as response:
             html = response.read().decode("utf-8")
-        self.assertIn("3DGS Gaussian Splat Renderer", html)
+        self.assertIn("2DGS / ArtiFixer3D Gaussian Splat Renderer", html)
 
         for asset in ("/gs-viewer.js", "/gs-worker.js"):
             with urllib.request.urlopen(f"{self.base_url}{asset}") as response:

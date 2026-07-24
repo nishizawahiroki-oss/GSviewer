@@ -1,12 +1,18 @@
 "use strict";
 
-// Streaming parser + depth sorter for full 3DGS PLY files (x/y/z + f_dc + opacity
-// + scale + rot).  Packs each gaussian into a 2-texel RGBA32UI row for the EWA
-// splatting shader in gs-viewer.js, then serves depth-sort requests over the
-// retained positions.
+// Streaming parser + depth sorter for Gaussian PLY files. Each Gaussian is
+// packed as raw center / activated scale / quaternion data so gs-viewer.js can
+// execute the official 2DGS surfel and ArtiFixer 3DGUT projection equations.
 
 const SH_C0 = 0.28209479177387814;
-const TEX_WIDTH = 2048; // 1024 splats per row, 2 texels per splat
+const TEXELS_PER_SPLAT = 3;
+const SPLATS_PER_ROW = 682;
+const TEX_WIDTH = TEXELS_PER_SPLAT * SPLATS_PER_ROW;
+
+const RENDERER_STANDARD_3DGS = 1;
+const RENDERER_2DGS = 2;
+const RENDERER_ARTIFIXER_3DGUT = 3;
+const RENDERER_LIGHT_PROXY = 4;
 
 const FLOAT_TYPES = new Set(["float", "float32"]);
 const PLY_TYPE_SIZES = {
@@ -18,39 +24,6 @@ const PLY_TYPE_SIZES = {
 
 let vertexCount = 0;
 let positions = null; // Float32Array(3n), retained for sorting
-
-const _halfFloat = new Float32Array(1);
-const _halfInt = new Int32Array(_halfFloat.buffer);
-
-function floatToHalf(value) {
-  _halfFloat[0] = value;
-  const f = _halfInt[0];
-  const sign = (f >> 31) & 0x0001;
-  const exp = (f >> 23) & 0x00ff;
-  let frac = f & 0x007fffff;
-  let newExp;
-  if (exp === 0) {
-    newExp = 0;
-  } else if (exp < 113) {
-    newExp = 0;
-    frac |= 0x00800000;
-    frac >>= 113 - exp;
-    if (frac & 0x01000000) {
-      newExp = 1;
-      frac = 0;
-    }
-  } else if (exp < 142) {
-    newExp = exp - 112;
-  } else {
-    newExp = 31;
-    frac = 0;
-  }
-  return (sign << 15) | (newExp << 10) | (frac >> 13);
-}
-
-function packHalf2x16(x, y) {
-  return (floatToHalf(x) | (floatToHalf(y) << 16)) >>> 0;
-}
 
 function fail(message) {
   throw new Error(message);
@@ -121,13 +94,17 @@ function parseHeaderText(text) {
     return property.offset;
   };
 
+  const scale2 = byName.scale_2 && FLOAT_TYPES.has(byName.scale_2.type)
+    ? byName.scale_2.offset
+    : -1;
   const plan = {
     count,
     stride,
+    dimension: scale2 >= 0 ? 3 : 2,
     x: requireFloat("x"),
     y: requireFloat("y"),
     z: requireFloat("z"),
-    scale: [requireFloat("scale_0"), requireFloat("scale_1"), requireFloat("scale_2")],
+    scale: [requireFloat("scale_0"), requireFloat("scale_1"), scale2],
     rot: [requireFloat("rot_0"), requireFloat("rot_1"), requireFloat("rot_2"), requireFloat("rot_3")],
     opacity: byName.opacity && FLOAT_TYPES.has(byName.opacity.type) ? byName.opacity.offset : -1,
     filter3d: byName.filter_3D && FLOAT_TYPES.has(byName.filter_3D.type) ? byName.filter_3D.offset : -1,
@@ -153,7 +130,127 @@ function emptyBounds() {
   };
 }
 
-async function parseStream(stream, totalBytes, fileName) {
+function lightProxyCount(lightSources) {
+  if (!Array.isArray(lightSources?.fixtures)) return 0;
+  return lightSources.fixtures.reduce((sum, fixture) => {
+    const count = fixture?.parametric_proxy?.proxy_count;
+    return sum + (Number.isInteger(count) && count > 0 ? count : 0);
+  }, 0);
+}
+
+function quaternionFromRotationMatrix(matrix) {
+  const m00 = matrix[0][0];
+  const m01 = matrix[0][1];
+  const m02 = matrix[0][2];
+  const m10 = matrix[1][0];
+  const m11 = matrix[1][1];
+  const m12 = matrix[1][2];
+  const m20 = matrix[2][0];
+  const m21 = matrix[2][1];
+  const m22 = matrix[2][2];
+  const trace = m00 + m11 + m22;
+  let qw;
+  let qx;
+  let qy;
+  let qz;
+  if (trace > 0) {
+    const s = Math.sqrt(trace + 1) * 2;
+    qw = 0.25 * s;
+    qx = (m21 - m12) / s;
+    qy = (m02 - m20) / s;
+    qz = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    qw = (m21 - m12) / s;
+    qx = 0.25 * s;
+    qy = (m01 + m10) / s;
+    qz = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    qw = (m02 - m20) / s;
+    qx = (m01 + m10) / s;
+    qy = 0.25 * s;
+    qz = (m12 + m21) / s;
+  } else {
+    const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+    qw = (m10 - m01) / s;
+    qx = (m02 + m20) / s;
+    qy = (m12 + m21) / s;
+    qz = 0.25 * s;
+  }
+  return [qw, qx, qy, qz];
+}
+
+function appendLightProxies(lightSources, startIndex, texdata, texFloat) {
+  const bindings = [];
+  let index = startIndex;
+  for (const fixture of lightSources?.fixtures || []) {
+    const proxy = fixture?.parametric_proxy;
+    if (!proxy) continue;
+    const count = proxy.proxy_count;
+    const position = proxy.position_world;
+    const extent = proxy.extent_98_percent_world_units;
+    const rotation = proxy.rotation_world_from_proxy;
+    const baseColor = proxy.base_emission_srgb_power_1;
+    if (!Number.isInteger(count) || count <= 0
+      || ![position, extent, baseColor].every((value) => Array.isArray(value) && value.length === 3)
+      || !Array.isArray(rotation) || rotation.length !== 3) continue;
+
+    const proxyStart = index;
+    const segmentLength = Math.max(0.02, Math.abs(extent[0]) / count);
+    const scales = [
+      Math.max(0.01, segmentLength / 3.2),
+      Math.max(0.01, Math.abs(extent[1]) / 3.2),
+      Math.max(0.008, Math.abs(extent[2]) / 3.2),
+    ];
+    const quaternion = quaternionFromRotationMatrix(rotation);
+    const intensity = Number.isFinite(proxy.relative_intensity_0_1)
+      ? proxy.relative_intensity_0_1 : 0.5;
+    const red = clampByte(baseColor[0] * intensity * 255);
+    const green = clampByte(baseColor[1] * intensity * 255);
+    const blue = clampByte(baseColor[2] * intensity * 255);
+    const proxyPositions = [];
+
+    for (let localIndex = 0; localIndex < count; localIndex += 1) {
+      const along = (localIndex - (count - 1) / 2) * segmentLength;
+      const x = position[0] + rotation[0][0] * along;
+      const y = position[1] + rotation[1][0] * along;
+      const z = position[2] + rotation[2][0] * along;
+      const offset3 = index * 3;
+      positions[offset3] = x;
+      positions[offset3 + 1] = y;
+      positions[offset3 + 2] = z;
+      proxyPositions.push(x, y, z);
+      const texBase = index * TEXELS_PER_SPLAT * 4;
+      texFloat[texBase] = x;
+      texFloat[texBase + 1] = y;
+      texFloat[texBase + 2] = z;
+      texFloat[texBase + 3] = 1;
+      texFloat[texBase + 4] = scales[0];
+      texFloat[texBase + 5] = scales[1];
+      texFloat[texBase + 6] = scales[2];
+      texdata[texBase + 7] =
+        ((RENDERER_LIGHT_PROXY << 24) | (blue << 16) | (green << 8) | red) >>> 0;
+      texFloat[texBase + 8] = quaternion[0];
+      texFloat[texBase + 9] = quaternion[1];
+      texFloat[texBase + 10] = quaternion[2];
+      texFloat[texBase + 11] = quaternion[3];
+      index += 1;
+    }
+    bindings.push({
+      fixtureId: fixture.fixture_id,
+      fixtureType: fixture.specification?.fixture_type || "unknown",
+      proxyStart,
+      proxyCount: count,
+      proxyPositions,
+      baseColor,
+      defaultIntensity: intensity,
+    });
+  }
+  return { bindings, endIndex: index };
+}
+
+async function parseStream(stream, totalBytes, fileName, lightSources = null, rendererHint = null) {
   const reader = stream.getReader();
   let pending = new Uint8Array(1 << 21);
   let pendingLength = 0;
@@ -167,6 +264,8 @@ async function parseStream(stream, totalBytes, fileName) {
   const samples = [[], [], []];
   const allBounds = emptyBounds();
   let lastProgress = 0;
+  let rendererKind = null;
+  let rendererCode = 0;
 
   const appendChunk = (chunk) => {
     if (pendingLength + chunk.length > pending.length) {
@@ -183,7 +282,7 @@ async function parseStream(stream, totalBytes, fileName) {
     const available = Math.min(Math.floor(pendingLength / stride), plan.count - index);
     if (available <= 0) return;
     const view = new DataView(pending.buffer, 0, available * stride);
-    const hasFilter = plan.filter3d >= 0;
+    const hasFilter = rendererKind === "3DGS" && plan.filter3d >= 0;
     const hasOpacity = plan.opacity >= 0;
     const useDc = plan.dc !== null;
 
@@ -207,15 +306,8 @@ async function parseStream(stream, totalBytes, fileName) {
       positions[offset3 + 2] = z;
 
       if (degenerate) {
-        const texBaseSkip = index * 8;
-        texFloat[texBaseSkip] = 0;
-        texFloat[texBaseSkip + 1] = 0;
-        texFloat[texBaseSkip + 2] = 0;
-        texdata[texBaseSkip + 3] = 0;
-        texdata[texBaseSkip + 4] = 0;
-        texdata[texBaseSkip + 5] = 0;
-        texdata[texBaseSkip + 6] = 0;
-        texdata[texBaseSkip + 7] = 0;
+        const texBaseSkip = index * TEXELS_PER_SPLAT * 4;
+        texdata.fill(0, texBaseSkip, texBaseSkip + TEXELS_PER_SPLAT * 4);
         index += 1;
         continue;
       }
@@ -253,7 +345,11 @@ async function parseStream(stream, totalBytes, fileName) {
       // Scales are stored as logs.
       let sx = Math.exp(view.getFloat32(base + plan.scale[0], true));
       let sy = Math.exp(view.getFloat32(base + plan.scale[1], true));
-      let sz = Math.exp(view.getFloat32(base + plan.scale[2], true));
+      // 2DGS stores only the two tangent-plane scales. The official surfel
+      // renderer consumes these directly and never invents a third scale.
+      let sz = plan.dimension === 3
+        ? Math.exp(view.getFloat32(base + plan.scale[2], true))
+        : 0;
 
       // Mip-Splatting 3D filter: widen the gaussian and compensate opacity.
       if (hasFilter) {
@@ -281,38 +377,20 @@ async function parseStream(stream, totalBytes, fileName) {
       qy /= qlen;
       qz /= qlen;
 
-      // M = diag(s) * R  (R here is the transpose of the INRIA build_rotation
-      // matrix), so sigma = M^T M = R_inria * S^2 * R_inria^T -- identical to
-      // the reference CUDA rasterizer's world-space covariance.
-      const m0 = (1 - 2 * (qy * qy + qz * qz)) * sx;
-      const m1 = 2 * (qx * qy + qw * qz) * sx;
-      const m2 = 2 * (qx * qz - qw * qy) * sx;
-      const m3 = 2 * (qx * qy - qw * qz) * sy;
-      const m4 = (1 - 2 * (qx * qx + qz * qz)) * sy;
-      const m5 = 2 * (qy * qz + qw * qx) * sy;
-      const m6 = 2 * (qx * qz + qw * qy) * sz;
-      const m7 = 2 * (qy * qz - qw * qx) * sz;
-      const m8 = (1 - 2 * (qx * qx + qy * qy)) * sz;
-
-      const sigma0 = m0 * m0 + m3 * m3 + m6 * m6; // xx
-      const sigma1 = m0 * m1 + m3 * m4 + m6 * m7; // xy
-      const sigma2 = m0 * m2 + m3 * m5 + m6 * m8; // xz
-      const sigma3 = m1 * m1 + m4 * m4 + m7 * m7; // yy
-      const sigma4 = m1 * m2 + m4 * m5 + m7 * m8; // yz
-      const sigma5 = m2 * m2 + m5 * m5 + m8 * m8; // zz
-
-      const texBase = index * 8;
+      const texBase = index * TEXELS_PER_SPLAT * 4;
       texFloat[texBase] = x;
       texFloat[texBase + 1] = y;
       texFloat[texBase + 2] = z;
-      texdata[texBase + 3] = 0;
-      // The quad spans [-2, 2]; scaling sigma by 4 makes exp(-dot(p, p)) in the
-      // fragment shader equal the true gaussian falloff exp(-r^2 / (2 sigma)).
-      texdata[texBase + 4] = packHalf2x16(4 * sigma0, 4 * sigma1);
-      texdata[texBase + 5] = packHalf2x16(4 * sigma2, 4 * sigma3);
-      texdata[texBase + 6] = packHalf2x16(4 * sigma4, 4 * sigma5);
+      texFloat[texBase + 3] = alpha;
+      texFloat[texBase + 4] = sx;
+      texFloat[texBase + 5] = sy;
+      texFloat[texBase + 6] = sz;
       texdata[texBase + 7] =
-        ((clampByte(alpha * 255) << 24) | (blue << 16) | (green << 8) | red) >>> 0;
+        ((rendererCode << 24) | (blue << 16) | (green << 8) | red) >>> 0;
+      texFloat[texBase + 8] = qw;
+      texFloat[texBase + 9] = qx;
+      texFloat[texBase + 10] = qy;
+      texFloat[texBase + 11] = qz;
 
       index += 1;
     }
@@ -336,15 +414,29 @@ async function parseStream(stream, totalBytes, fileName) {
       }
       const text = new TextDecoder("ascii").decode(pending.subarray(0, headerEnd));
       plan = parseHeaderText(text);
-      vertexCount = plan.count;
+      const artifixerByName = /artifixer/i.test(fileName);
+      rendererKind = plan.dimension === 2
+        ? "2DGS"
+        : (rendererHint === "ArtiFixer3D" || artifixerByName ? "ArtiFixer3D" : "3DGS");
+      rendererCode = rendererKind === "2DGS"
+        ? RENDERER_2DGS
+        : (rendererKind === "ArtiFixer3D" ? RENDERER_ARTIFIXER_3DGUT : RENDERER_STANDARD_3DGS);
+      const generatedLightCount = lightProxyCount(lightSources);
+      vertexCount = plan.count + generatedLightCount;
       positions = new Float32Array(vertexCount * 3);
-      texHeight = Math.ceil((2 * vertexCount) / TEX_WIDTH);
+      texHeight = Math.ceil(vertexCount / SPLATS_PER_ROW);
       texdata = new Uint32Array(TEX_WIDTH * texHeight * 4);
       texFloat = new Float32Array(texdata.buffer);
       sampleStep = Math.max(1, Math.ceil(vertexCount / 60000));
       pending.copyWithin(0, headerEnd, pendingLength);
       pendingLength -= headerEnd;
-      self.postMessage({ type: "header", vertexCount, fileName });
+      self.postMessage({
+        type: "header",
+        vertexCount: plan.count,
+        lightProxyCount: generatedLightCount,
+        gaussianKind: rendererKind,
+        fileName,
+      });
     }
 
     processRecords();
@@ -371,6 +463,12 @@ async function parseStream(stream, totalBytes, fileName) {
     fail(`PLY ended early: ${index.toLocaleString()} / ${plan.count.toLocaleString()} gaussians.`);
   }
 
+  const lightResult = appendLightProxies(lightSources, index, texdata, texFloat);
+  index = lightResult.endIndex;
+  if (index !== vertexCount) {
+    fail(`Generated light proxy count mismatch: ${index - plan.count} / ${vertexCount - plan.count}.`);
+  }
+
   for (const axis of samples) axis.sort((a, b) => a - b);
   const quantile = (axis, fraction) => axis[Math.round((axis.length - 1) * fraction)];
   const bounds = {
@@ -388,6 +486,9 @@ async function parseStream(stream, totalBytes, fileName) {
       texWidth: TEX_WIDTH,
       texHeight,
       vertexCount,
+      sceneVertexCount: plan.count,
+      gaussianKind: rendererKind,
+      lightBindings: lightResult.bindings,
       bounds,
       fileName,
     },
@@ -441,9 +542,21 @@ self.onmessage = async (event) => {
       if (!response.ok) fail(`PLY request failed: HTTP ${response.status}`);
       const total = Number.parseInt(response.headers.get("content-length") || "0", 10);
       if (!response.body) fail("Streaming download is unavailable in this browser.");
-      await parseStream(response.body, total, data.fileName || "pointcloud.ply");
+      await parseStream(
+        response.body,
+        total,
+        data.fileName || "pointcloud.ply",
+        data.lightSources || null,
+        data.rendererHint || null,
+      );
     } else if (data?.type === "load-file") {
-      await parseStream(data.file.stream(), data.file.size, data.file.name);
+      await parseStream(
+        data.file.stream(),
+        data.file.size,
+        data.file.name,
+        data.lightSources || null,
+        data.rendererHint || null,
+      );
     } else if (data?.type === "sort") {
       if (!positions) return;
       const started = Date.now();

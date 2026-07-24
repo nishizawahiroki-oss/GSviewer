@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>3DGS Gaussian Splat Renderer</title>
+    <title>2DGS / ArtiFixer3D Gaussian Splat Renderer</title>
     <style>
       :root {
         color-scheme: dark;
@@ -40,6 +40,17 @@
       }
 
       #viewport { display: block; width: 100%; height: 100%; touch-action: none; background: #10131a; }
+      .selection-marker {
+        position: fixed;
+        display: none;
+        min-width: 22px;
+        min-height: 22px;
+        border: 2px solid #ffffff;
+        border-radius: 6px;
+        box-shadow: 0 0 0 1px rgba(16, 19, 26, 0.9), 0 0 12px rgba(101, 184, 255, 0.9);
+        pointer-events: none;
+        z-index: 1;
+      }
 
       .topbar {
         position: fixed;
@@ -99,6 +110,9 @@
       .control { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; margin: 9px 0; font-size: 13px; }
       .control input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
       .control input[type="color"] { width: 44px; height: 28px; padding: 1px; border: 0; background: transparent; }
+      .control select { grid-column: 1 / -1; width: 100%; min-width: 0; }
+      .control:has(select) { grid-template-columns: 1fr; }
+      .control input:disabled, .control select:disabled { cursor: not-allowed; opacity: 0.45; }
       .flip-group { display: flex; gap: 12px; }
       .flip-group label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
       .flip-group input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
@@ -170,10 +184,11 @@
   </head>
   <body>
     <canvas id="viewport" aria-label="3D gaussian splatting viewport"></canvas>
+    <div id="selection-marker" class="selection-marker" aria-hidden="true"></div>
 
     <header class="topbar">
       <div class="brand">
-        <h1>3DGS Gaussian Splat Renderer</h1>
+        <h1>2DGS / ArtiFixer3D / 3DGS Renderer</h1>
         <p id="file-name">PLY を読み込んでいます…</p>
       </div>
       <a class="nav-link" href="/">点群表示</a>
@@ -186,10 +201,31 @@
         <h2 class="section-title">Data</h2>
         <div class="stats">
           <span>ガウシアン数</span><span id="splat-count">—</span>
+          <span>光源</span><span id="light-count">—</span>
+          <span>光源プロキシ</span><span id="light-proxy-count">—</span>
           <span>ファイル</span><span id="file-size">—</span>
           <span>深度ソート</span><span id="sort-time">—</span>
           <span>FPS</span><span id="fps">—</span>
         </div>
+      </section>
+
+      <section class="section" id="lights-section">
+        <h2 class="section-title">Lights</h2>
+        <label class="control"><span>全光源</span><input id="lights-enabled" type="checkbox" checked disabled /></label>
+        <label class="control">
+          <span>全体強度</span><output id="master-intensity-value">1.00×</output>
+          <input id="master-intensity" type="range" min="0" max="2" step="0.05" value="1" disabled aria-label="全光源の強度" />
+        </label>
+        <label class="control">
+          <span>灯具を選択</span>
+          <select id="fixture-select" disabled aria-label="操作する灯具"></select>
+        </label>
+        <label class="control"><span>選択した灯具</span><input id="fixture-enabled" type="checkbox" checked disabled /></label>
+        <label class="control">
+          <span>灯具強度</span><output id="fixture-intensity-value">—</output>
+          <input id="fixture-intensity" type="range" min="0" max="2" step="0.05" value="0.5" disabled aria-label="選択した灯具の強度" />
+        </label>
+        <label class="control"><span>発光色</span><input id="fixture-color" type="color" value="#ffffff" disabled /></label>
       </section>
 
       <section class="section">
@@ -221,8 +257,9 @@
       </section>
 
       <section class="section help">
-        異方性楕円 + 不透明度の front-to-back 合成で描画します。
-        色は SH の DC 項（視点依存の高次 SH は未適用）。<br />
+        2DGS は公式 surfel 交差、ArtiFixer3D は公式 3DGUT の UT 射影と ray density、
+        通常の 3DGS は EWA 楕円で描画します。色は SH の DC 項（視点依存の高次 SH は未適用）。<br />
+        光源パッケージの灯具は emissive proxy 表示です。背景表面の再照明・影生成は行いません。<br />
         <strong>回転</strong> 左ドラッグ　<strong>移動</strong> 右ドラッグ / Shift+左ドラッグ<br />
         <strong>ズーム</strong> ホイール / トラックパッド　<strong>リセット</strong> ダブルクリック
       </section>
@@ -233,7 +270,7 @@
 
     <div id="loading" class="loading">
       <div class="loading-card">
-        <p id="progress-label">3DGS PLY を読み込んでいます</p>
+        <p id="progress-label">Gaussian PLY を読み込んでいます</p>
         <div class="progress-track"><div id="progress-bar"></div></div>
         <p id="progress-detail">準備中…</p>
       </div>

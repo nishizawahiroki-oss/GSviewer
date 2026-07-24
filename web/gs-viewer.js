@@ -1,7 +1,22 @@
 "use strict";
 
-// WebGL2 gaussian-splat renderer: anisotropic EWA splats with front-to-back
-// "under" alpha blending.  Parsing and depth sorting run in gs-worker.js.
+// WebGL2 Gaussian renderer with front-to-back "under" alpha blending.
+// This file is a modified browser/GLSL adaptation; it does not contain or run
+// the upstream CUDA / OptiX backend.
+//
+// 2DGS-derived portions:
+// Copyright (C) 2023, Inria
+// GRAPHDECO research group, https://team.inria.fr/graphdeco
+// All rights reserved. Licensed for non-commercial research/evaluation under
+// licenses/Gaussian-Splatting-License.md.
+//
+// ArtiFixer3D-derived portions:
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+// SPDX-License-Identifier: Apache-2.0
+//
+// The 2DGS path adapts hbb1/diff-surfel-rasterization forward.cu equations
+// 8-10 (commit e0ed020), and the ArtiFixer3D path adapts the 3DGUT projection
+// and density response from nv-tlabs/3DGRUT-ArtiFixer (commit 62e1038).
 
 const canvas = document.querySelector("#viewport");
 const ui = Object.fromEntries(
@@ -9,6 +24,8 @@ const ui = Object.fromEntries(
     "file-name",
     "file-input",
     "splat-count",
+    "light-count",
+    "light-proxy-count",
     "file-size",
     "sort-time",
     "fps",
@@ -17,6 +34,15 @@ const ui = Object.fromEntries(
     "splat-scale-value",
     "alpha-threshold",
     "alpha-threshold-value",
+    "lights-enabled",
+    "master-intensity",
+    "master-intensity-value",
+    "fixture-select",
+    "fixture-enabled",
+    "fixture-intensity",
+    "fixture-intensity-value",
+    "fixture-color",
+    "selection-marker",
     "flip-x",
     "flip-y",
     "flip-z",
@@ -61,87 +87,309 @@ uniform float uAlphaThreshold;
 layout(location = 0) in vec2 aPosition;
 layout(location = 1) in int aIndex;
 
-out vec4 vColor;
+flat out uint vRenderer;
+flat out vec4 vColor;
+flat out vec3 vCenter;
+flat out vec3 vScale;
+flat out vec3 vRotation0;
+flat out vec3 vRotation1;
+flat out vec3 vRotation2;
+flat out vec3 vTu;
+flat out vec3 vTv;
+flat out vec3 vTw;
+flat out vec2 vSurfelCenter;
 out vec2 vPosition;
 
-void main() {
-  uvec4 cen = texelFetch(uTexture, ivec2((uint(aIndex) & 0x3ffu) << 1, uint(aIndex) >> 10), 0);
-  vec4 cam = uView * vec4(uintBitsToFloat(cen.xyz), 1.0);
-  vec4 pos2d = uProjection * cam;
+const uint STANDARD_3DGS = 1u;
+const uint OFFICIAL_2DGS = 2u;
+const uint ARTIFIXER_3DGUT = 3u;
+const uint LIGHT_PROXY = 4u;
+const uint SPLATS_PER_ROW = 682u;
 
-  float clip = 1.2 * pos2d.w;
-  if (pos2d.z < -clip || pos2d.x < -clip || pos2d.x > clip || pos2d.y < -clip || pos2d.y > clip) {
-    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-    return;
-  }
+ivec2 splatTexel(uint index, uint offset) {
+  uint row = index / SPLATS_PER_ROW;
+  uint column = (index - row * SPLATS_PER_ROW) * 3u + offset;
+  return ivec2(int(column), int(row));
+}
 
-  uvec4 cov = texelFetch(uTexture, ivec2(((uint(aIndex) & 0x3ffu) << 1) | 1u, uint(aIndex) >> 10), 0);
-  if (float(cov.w >> 24) / 255.0 < uAlphaThreshold) {
-    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-    return;
-  }
-  vec2 u1 = unpackHalf2x16(cov.x);
-  vec2 u2 = unpackHalf2x16(cov.y);
-  vec2 u3 = unpackHalf2x16(cov.z);
-  mat3 Vrk = mat3(u1.x, u1.y, u2.x, u1.y, u2.y, u3.x, u2.x, u3.x, u3.y);
+mat3 quaternionToRotation(vec4 quaternion) {
+  vec4 q = quaternion / max(length(quaternion), 1.0e-12);
+  float w = q.x;
+  float x = q.y;
+  float y = q.z;
+  float z = q.w;
+  return mat3(
+    1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
+    2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+    2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)
+  );
+}
 
+vec2 projectPixel(vec3 point) {
+  vec3 camera = (uView * vec4(point, 1.0)).xyz;
+  if (camera.z <= 0.0) return vec2(0.0);
+  return vec2(
+    uFocal.x * camera.x / camera.z + 0.5 * uViewport.x,
+    -uFocal.y * camera.y / camera.z + 0.5 * uViewport.y
+  );
+}
+
+void hideSplat() {
+  gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+}
+
+void renderStandard3D(vec3 center, vec3 scale, mat3 rotation, vec4 clipCenter) {
+  mat3 scaledRotation = rotation * mat3(
+    scale.x, 0.0, 0.0,
+    0.0, scale.y, 0.0,
+    0.0, 0.0, scale.z
+  );
+  mat3 covariance = scaledRotation * transpose(scaledRotation);
+  vec3 cam = (uView * vec4(center, 1.0)).xyz;
   mat3 J = mat3(
     uFocal.x / cam.z, 0.0, -(uFocal.x * cam.x) / (cam.z * cam.z),
     0.0, -uFocal.y / cam.z, (uFocal.y * cam.y) / (cam.z * cam.z),
     0.0, 0.0, 0.0
   );
   mat3 T = transpose(mat3(uView)) * J;
-  mat3 cov2d = transpose(T) * Vrk * T;
+  mat3 cov2d = 4.0 * transpose(T) * covariance * T;
 
-  // Mip-Splatting screen-space low-pass: dilate by 0.1 px^2 and compensate
-  // the opacity by the determinant ratio (this checkpoint stores filter_3D,
-  // so it was trained with this 2D kernel).
   float detBefore = cov2d[0][0] * cov2d[1][1] - cov2d[0][1] * cov2d[0][1];
   cov2d[0][0] += 0.1;
   cov2d[1][1] += 0.1;
   float detAfter = cov2d[0][0] * cov2d[1][1] - cov2d[0][1] * cov2d[0][1];
-  float alphaCompensation = sqrt(max(0.0, detBefore / detAfter));
+  vColor.a *= sqrt(max(0.0, detBefore / detAfter));
 
   float mid = (cov2d[0][0] + cov2d[1][1]) / 2.0;
   float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
   float lambda1 = mid + radius;
   float lambda2 = mid - radius;
   if (lambda2 < 0.0) {
-    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    hideSplat();
     return;
   }
   vec2 eigenDirection = vec2(cov2d[0][1], lambda1 - cov2d[0][0]);
   vec2 diagonalVector = dot(eigenDirection, eigenDirection) < 1.0e-24
     ? vec2(1.0, 0.0)
     : normalize(eigenDirection);
-  vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector * uSplatScale;
-  vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x) * uSplatScale;
-
-  vColor = clamp(pos2d.z / pos2d.w + 1.0, 0.0, 1.0)
-    * vec4(float(cov.w & 0xffu), float((cov.w >> 8) & 0xffu), float((cov.w >> 16) & 0xffu), float(cov.w >> 24) * alphaCompensation) / 255.0;
+  vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
+  vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
   vPosition = aPosition;
-
-  vec2 vCenter = pos2d.xy / pos2d.w;
+  vec2 projectedCenter = clipCenter.xy / clipCenter.w;
   gl_Position = vec4(
-    vCenter + aPosition.x * majorAxis / uViewport + aPosition.y * minorAxis / uViewport,
+    projectedCenter + aPosition.x * majorAxis / uViewport + aPosition.y * minorAxis / uViewport,
     0.0,
     1.0
   );
+}
+
+void renderOfficial2DGS(vec3 center, vec3 scale, mat3 rotation) {
+  mat4 worldToClip = uProjection * uView;
+  vec4 clipU = worldToClip * vec4(rotation[0] * scale.x, 0.0);
+  vec4 clipV = worldToClip * vec4(rotation[1] * scale.y, 0.0);
+  vec4 clipC = worldToClip * vec4(center, 1.0);
+  vec2 pixelOffset = (uViewport - 1.0) * 0.5;
+  vTu = vec3(
+    0.5 * uViewport.x * clipU.x + pixelOffset.x * clipU.w,
+    0.5 * uViewport.x * clipV.x + pixelOffset.x * clipV.w,
+    0.5 * uViewport.x * clipC.x + pixelOffset.x * clipC.w
+  );
+  vTv = vec3(
+    0.5 * uViewport.y * clipU.y + pixelOffset.y * clipU.w,
+    0.5 * uViewport.y * clipV.y + pixelOffset.y * clipV.w,
+    0.5 * uViewport.y * clipC.y + pixelOffset.y * clipC.w
+  );
+  vTw = vec3(clipU.w, clipV.w, clipC.w);
+
+  vec3 cutoff = vec3(9.0, 9.0, -1.0);
+  float denominator = dot(cutoff, vTw * vTw);
+  if (abs(denominator) < 1.0e-10) {
+    hideSplat();
+    return;
+  }
+  vec3 f = cutoff / denominator;
+  vSurfelCenter = vec2(dot(f, vTu * vTw), dot(f, vTv * vTw));
+  vec2 extentSq = vSurfelCenter * vSurfelCenter
+    - vec2(dot(f, vTu * vTu), dot(f, vTv * vTv));
+  vec2 conicExtent = sqrt(max(vec2(1.0e-4), extentSq));
+  float radius = max(max(conicExtent.x, conicExtent.y), 3.0 * 0.707106);
+  vec2 extent = vec2(radius);
+  vec2 centerNdc = 2.0 * ((vSurfelCenter + 0.5) / uViewport) - 1.0;
+  gl_Position = vec4(centerNdc + aPosition * extent / uViewport, 0.0, 1.0);
+  vPosition = aPosition;
+}
+
+void renderArtiFixer3DGUT(vec3 center, vec3 scale, mat3 rotation) {
+  // Official ArtiFixer3D uses 3DGUT with alpha=1, beta=2, kappa=0.
+  // Lambda is therefore zero and the six off-center sigma points have 1/6 weight.
+  const float delta = 1.7320508075688772;
+  vec2 sigma0 = projectPixel(center);
+  vec2 sigma1 = projectPixel(center + delta * scale.x * rotation[0]);
+  vec2 sigma2 = projectPixel(center + delta * scale.y * rotation[1]);
+  vec2 sigma3 = projectPixel(center + delta * scale.z * rotation[2]);
+  vec2 sigma4 = projectPixel(center - delta * scale.x * rotation[0]);
+  vec2 sigma5 = projectPixel(center - delta * scale.y * rotation[1]);
+  vec2 sigma6 = projectPixel(center - delta * scale.z * rotation[2]);
+  vec2 projectedCenter = (sigma1 + sigma2 + sigma3 + sigma4 + sigma5 + sigma6) / 6.0;
+
+  vec2 d0 = sigma0 - projectedCenter;
+  vec2 d1 = sigma1 - projectedCenter;
+  vec2 d2 = sigma2 - projectedCenter;
+  vec2 d3 = sigma3 - projectedCenter;
+  vec2 d4 = sigma4 - projectedCenter;
+  vec2 d5 = sigma5 - projectedCenter;
+  vec2 d6 = sigma6 - projectedCenter;
+  vec3 covariance = 2.0 * vec3(d0.x * d0.x, d0.x * d0.y, d0.y * d0.y);
+  covariance += (vec3(d1.x * d1.x, d1.x * d1.y, d1.y * d1.y)
+    + vec3(d2.x * d2.x, d2.x * d2.y, d2.y * d2.y)
+    + vec3(d3.x * d3.x, d3.x * d3.y, d3.y * d3.y)
+    + vec3(d4.x * d4.x, d4.x * d4.y, d4.y * d4.y)
+    + vec3(d5.x * d5.x, d5.x * d5.y, d5.y * d5.y)
+    + vec3(d6.x * d6.x, d6.x * d6.y, d6.y * d6.y)) / 6.0;
+
+  vec3 dilated = covariance + vec3(0.3, 0.0, 0.3);
+  float determinant = dilated.x * dilated.z - dilated.y * dilated.y;
+  float originalDeterminant = covariance.x * covariance.z - covariance.y * covariance.y;
+  if (!(determinant > 0.0)) {
+    hideSplat();
+    return;
+  }
+  float projectedOpacity = vColor.a * sqrt(max(0.000025, originalDeterminant / determinant));
+  if (projectedOpacity < 1.0 / 255.0) {
+    hideSplat();
+    return;
+  }
+  float extentFactor = min(3.33, sqrt(2.0 * log(projectedOpacity * 255.0)));
+  float mid = 0.5 * (dilated.x + dilated.z);
+  float lambda = mid + sqrt(max(0.01, mid * mid - determinant));
+  float radius = extentFactor * sqrt(lambda);
+  vec2 extent = min(extentFactor * sqrt(vec2(dilated.x, dilated.z)), vec2(radius));
+  vec2 centerNdc = 2.0 * (projectedCenter / uViewport) - 1.0;
+  gl_Position = vec4(centerNdc + aPosition * extent / uViewport, 0.0, 1.0);
+  vPosition = aPosition;
+}
+
+void main() {
+  uint index = uint(aIndex);
+  uvec4 rawCenter = texelFetch(uTexture, splatTexel(index, 0u), 0);
+  uvec4 rawScaleColor = texelFetch(uTexture, splatTexel(index, 1u), 0);
+  uvec4 rawRotation = texelFetch(uTexture, splatTexel(index, 2u), 0);
+  uint packedColorRenderer = rawScaleColor.w;
+  vRenderer = packedColorRenderer >> 24;
+  vCenter = uintBitsToFloat(rawCenter.xyz);
+  vScale = uintBitsToFloat(rawScaleColor.xyz) * uSplatScale;
+  vec4 quaternion = uintBitsToFloat(rawRotation);
+  mat3 rotation = quaternionToRotation(quaternion);
+  vRotation0 = rotation[0];
+  vRotation1 = rotation[1];
+  vRotation2 = rotation[2];
+  vColor = vec4(
+    float(packedColorRenderer & 0xffu) / 255.0,
+    float((packedColorRenderer >> 8) & 0xffu) / 255.0,
+    float((packedColorRenderer >> 16) & 0xffu) / 255.0,
+    uintBitsToFloat(rawCenter.w)
+  );
+
+  vec4 cameraCenter = uView * vec4(vCenter, 1.0);
+  vec4 clipCenter = uProjection * cameraCenter;
+  float minimumDepth = (vRenderer == ARTIFIXER_3DGUT || vRenderer == OFFICIAL_2DGS)
+    ? 0.2 : 1.0e-5;
+  if (cameraCenter.z < minimumDepth || vColor.a < uAlphaThreshold) {
+    hideSplat();
+    return;
+  }
+  float clip = 1.2 * clipCenter.w;
+  if (clipCenter.z < -clip || clipCenter.x < -clip || clipCenter.x > clip
+    || clipCenter.y < -clip || clipCenter.y > clip) {
+    hideSplat();
+    return;
+  }
+
+  if (vRenderer == OFFICIAL_2DGS) {
+    renderOfficial2DGS(vCenter, vScale, rotation);
+  } else if (vRenderer == ARTIFIXER_3DGUT) {
+    renderArtiFixer3DGUT(vCenter, vScale, rotation);
+  } else if (vRenderer == STANDARD_3DGS || vRenderer == LIGHT_PROXY) {
+    renderStandard3D(vCenter, vScale, rotation, clipCenter);
+  } else {
+    hideSplat();
+  }
 }
 `;
 
 const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
+precision highp int;
 
-in vec4 vColor;
+uniform mat4 uView;
+uniform vec3 uCameraPosition;
+uniform vec2 uFocal;
+uniform vec2 uViewport;
+
+flat in uint vRenderer;
+flat in vec4 vColor;
+flat in vec3 vCenter;
+flat in vec3 vScale;
+flat in vec3 vRotation0;
+flat in vec3 vRotation1;
+flat in vec3 vRotation2;
+flat in vec3 vTu;
+flat in vec3 vTv;
+flat in vec3 vTw;
+flat in vec2 vSurfelCenter;
 in vec2 vPosition;
 out vec4 fragColor;
 
+const uint STANDARD_3DGS = 1u;
+const uint OFFICIAL_2DGS = 2u;
+const uint ARTIFIXER_3DGUT = 3u;
+const uint LIGHT_PROXY = 4u;
+
+float official2DGSAlpha() {
+  vec2 pixel = gl_FragCoord.xy - 0.5;
+  vec3 k = pixel.x * vTw - vTu;
+  vec3 l = pixel.y * vTw - vTv;
+  vec3 intersection = cross(k, l);
+  if (abs(intersection.z) < 1.0e-10) return 0.0;
+  vec2 surfel = intersection.xy / intersection.z;
+  float rho3d = dot(surfel, surfel);
+  vec2 centerDelta = vSurfelCenter - pixel;
+  float rho2d = 2.0 * dot(centerDelta, centerDelta);
+  float rho = min(rho3d, rho2d);
+  return min(0.99, vColor.a * exp(-0.5 * rho));
+}
+
+float artiFixer3DGUTAlpha() {
+  vec3 cameraDirection = normalize(vec3(
+    (gl_FragCoord.x - 0.5 * uViewport.x) / uFocal.x,
+    -(gl_FragCoord.y - 0.5 * uViewport.y) / uFocal.y,
+    1.0
+  ));
+  vec3 rayDirection = normalize(transpose(mat3(uView)) * cameraDirection);
+  mat3 rotation = mat3(vRotation0, vRotation1, vRotation2);
+  vec3 inverseScale = 1.0 / max(vScale, vec3(1.0e-10));
+  vec3 localOrigin = inverseScale * (transpose(rotation) * (uCameraPosition - vCenter));
+  vec3 localDirection = normalize(inverseScale * (transpose(rotation) * rayDirection));
+  vec3 closestVector = cross(localDirection, localOrigin);
+  float squaredDistance = dot(closestVector, closestVector);
+  float response = exp(-0.5 * squaredDistance);
+  if (response <= 0.0113) return 0.0;
+  return min(0.99, response * vColor.a);
+}
+
 void main() {
-  float A = -dot(vPosition, vPosition);
-  if (A < -4.0) discard;
-  float B = exp(A) * vColor.a;
-  fragColor = vec4(B * vColor.rgb, B);
+  float alpha;
+  if (vRenderer == OFFICIAL_2DGS) {
+    alpha = official2DGSAlpha();
+  } else if (vRenderer == ARTIFIXER_3DGUT) {
+    alpha = artiFixer3DGUTAlpha();
+  } else {
+    float power = -dot(vPosition, vPosition);
+    if (power < -4.0) discard;
+    alpha = min(0.99, exp(power) * vColor.a);
+  }
+  if (alpha < 1.0 / 255.0) discard;
+  fragColor = vec4(alpha * vColor.rgb, alpha);
 }
 `;
 
@@ -179,6 +427,7 @@ const uniforms = {
   texture: gl.getUniformLocation(program, "uTexture"),
   projection: gl.getUniformLocation(program, "uProjection"),
   view: gl.getUniformLocation(program, "uView"),
+  cameraPosition: gl.getUniformLocation(program, "uCameraPosition"),
   focal: gl.getUniformLocation(program, "uFocal"),
   viewport: gl.getUniformLocation(program, "uViewport"),
   splatScale: gl.getUniformLocation(program, "uSplatScale"),
@@ -223,6 +472,10 @@ let contextLost = false;
 let progressHideTimer = null;
 let frameCount = 0;
 let fpsWindowStart = performance.now();
+let textureData = null;
+let lightBindings = [];
+let lightStates = new Map();
+let latestViewProjection = null;
 
 const orbit = {
   target: [0, 0, 0],
@@ -303,6 +556,199 @@ function formatBytes(value) {
     unit += 1;
   }
   return `${amount.toFixed(unit > 1 ? 1 : 0)} ${units[unit]}`;
+}
+
+function colorToHex(color) {
+  return `#${color.map((value) => Math.max(0, Math.min(255, Math.round(value * 255)))
+    .toString(16).padStart(2, "0")).join("")}`;
+}
+
+function hexToColor(value) {
+  return [1, 3, 5].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16) / 255);
+}
+
+function setLightControlAvailability(available) {
+  for (const id of [
+    "lights-enabled",
+    "master-intensity",
+    "fixture-select",
+    "fixture-enabled",
+    "fixture-intensity",
+    "fixture-color",
+  ]) ui[id].disabled = !available;
+}
+
+function selectedLightState() {
+  return lightStates.get(ui["fixture-select"].value) || null;
+}
+
+function syncSelectedLightControls() {
+  const state = selectedLightState();
+  if (!state) {
+    ui["fixture-intensity-value"].textContent = "—";
+    return;
+  }
+  ui["fixture-enabled"].checked = state.enabled;
+  ui["fixture-intensity"].value = String(state.intensity);
+  ui["fixture-intensity-value"].textContent = `${state.intensity.toFixed(2)}×`;
+  ui["fixture-color"].value = colorToHex(state.color);
+}
+
+function projectLightPosition(position) {
+  if (!latestViewProjection) return null;
+  const matrix = latestViewProjection;
+  const clipX = matrix[0] * position[0] + matrix[4] * position[1]
+    + matrix[8] * position[2] + matrix[12];
+  const clipY = matrix[1] * position[0] + matrix[5] * position[1]
+    + matrix[9] * position[2] + matrix[13];
+  const clipZ = matrix[2] * position[0] + matrix[6] * position[1]
+    + matrix[10] * position[2] + matrix[14];
+  const clipW = matrix[3] * position[0] + matrix[7] * position[1]
+    + matrix[11] * position[2] + matrix[15];
+  if (!(clipW > 0) || clipZ < 0 || clipZ > clipW) return null;
+  const bounds = canvas.getBoundingClientRect();
+  return {
+    x: bounds.left + (clipX / clipW * 0.5 + 0.5) * bounds.width,
+    y: bounds.top + (0.5 - clipY / clipW * 0.5) * bounds.height,
+    depth: clipZ / clipW,
+  };
+}
+
+function projectedBindingPoints(binding) {
+  const points = [];
+  const positions = binding.proxyPositions || [];
+  for (let offset = 0; offset < positions.length; offset += 3) {
+    const projected = projectLightPosition(positions.slice(offset, offset + 3));
+    if (projected) points.push(projected);
+  }
+  return points;
+}
+
+function findLightAt(clientX, clientY, radius = 24) {
+  if (!ui["lights-enabled"].checked || Number.parseFloat(ui["master-intensity"].value) <= 0) {
+    return null;
+  }
+  let best = null;
+  for (const binding of lightBindings) {
+    const state = lightStates.get(binding.fixtureId);
+    if (!state?.enabled || state.intensity <= 0) continue;
+    for (const point of projectedBindingPoints(binding)) {
+      const distance = Math.hypot(point.x - clientX, point.y - clientY);
+      if (distance > radius) continue;
+      if (!best || distance < best.distance - 1 || (
+        Math.abs(distance - best.distance) <= 1 && point.depth < best.depth
+      )) best = { binding, distance, depth: point.depth };
+    }
+  }
+  return best?.binding || null;
+}
+
+function updateSelectionMarker() {
+  const binding = lightBindings.find(
+    (item) => item.fixtureId === ui["fixture-select"].value,
+  );
+  const points = binding ? projectedBindingPoints(binding) : [];
+  if (!points.length) {
+    ui["selection-marker"].style.display = "none";
+    return;
+  }
+  const xValues = points.map((point) => point.x);
+  const yValues = points.map((point) => point.y);
+  const padding = 10;
+  const left = Math.min(...xValues) - padding;
+  const top = Math.min(...yValues) - padding;
+  const width = Math.max(22, Math.max(...xValues) - Math.min(...xValues) + padding * 2);
+  const height = Math.max(22, Math.max(...yValues) - Math.min(...yValues) + padding * 2);
+  Object.assign(ui["selection-marker"].style, {
+    display: "block",
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+  });
+}
+
+function selectLight(binding) {
+  if (!binding) return false;
+  ui["fixture-select"].value = binding.fixtureId;
+  syncSelectedLightControls();
+  updateSelectionMarker();
+  return true;
+}
+
+function packedLightColor(state) {
+  const enabled = ui["lights-enabled"].checked && state.enabled;
+  const intensity = enabled
+    ? state.intensity * Number.parseFloat(ui["master-intensity"].value) : 0;
+  const channels = state.color.map((value) => Math.max(0, Math.min(255, Math.round(value * intensity * 255))));
+  return ((4 << 24) | (channels[2] << 16) | (channels[1] << 8) | channels[0]) >>> 0;
+}
+
+function updateLightTexture(binding) {
+  if (!binding) return;
+  const state = lightStates.get(binding.fixtureId);
+  if (!state || !textureData) return;
+  const packedColor = packedLightColor(state);
+  const visible = ui["lights-enabled"].checked && state.enabled
+    && state.intensity * Number.parseFloat(ui["master-intensity"].value) > 0.0001;
+  const textureFloats = new Float32Array(textureData.buffer);
+  gl.bindTexture(gl.TEXTURE_2D, splatTexture);
+  for (let index = binding.proxyStart; index < binding.proxyStart + binding.proxyCount; index += 1) {
+    const base = index * 12;
+    textureFloats[base + 3] = visible ? 1 : 0;
+    textureData[base + 7] = packedColor;
+    const x = (index % 682) * 3;
+    const y = Math.floor(index / 682);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      x,
+      y,
+      1,
+      1,
+      gl.RGBA_INTEGER,
+      gl.UNSIGNED_INT,
+      textureData.subarray(base, base + 4),
+    );
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      x + 1,
+      y,
+      1,
+      1,
+      gl.RGBA_INTEGER,
+      gl.UNSIGNED_INT,
+      textureData.subarray(base + 4, base + 8),
+    );
+  }
+}
+
+function updateAllLightTextures() {
+  for (const binding of lightBindings) updateLightTexture(binding);
+}
+
+function initializeLightControls(bindings) {
+  lightBindings = bindings || [];
+  lightStates = new Map();
+  ui["fixture-select"].replaceChildren();
+  for (const binding of lightBindings) {
+    lightStates.set(binding.fixtureId, {
+      enabled: true,
+      intensity: binding.defaultIntensity,
+      color: binding.baseColor.map((value) => Math.max(0, Math.min(1, value))),
+    });
+    const option = document.createElement("option");
+    option.value = binding.fixtureId;
+    option.textContent = `${binding.fixtureId} · ${binding.fixtureType}`;
+    ui["fixture-select"].append(option);
+  }
+  ui["light-count"].textContent = formatCount(lightBindings.length);
+  ui["light-proxy-count"].textContent = formatCount(
+    lightBindings.reduce((sum, binding) => sum + binding.proxyCount, 0),
+  );
+  setLightControlAvailability(lightBindings.length > 0);
+  syncSelectedLightControls();
 }
 
 function vec3Subtract(a, b) {
@@ -457,11 +903,19 @@ function render() {
   }
   drawAxisGizmo(view);
   const viewProj = multiplyMatrices(projection, view);
+  latestViewProjection = viewProj;
+  updateSelectionMarker();
   maybeRequestSort(viewProj);
   if (!sortedCount) return;
 
   gl.uniformMatrix4fv(uniforms.projection, false, projection);
   gl.uniformMatrix4fv(uniforms.view, false, view);
+  gl.uniform3f(
+    uniforms.cameraPosition,
+    signs[0] * eye[0],
+    signs[1] * eye[1],
+    signs[2] * eye[2],
+  );
   gl.uniform2f(uniforms.focal, focal, focal);
   gl.uniform2f(uniforms.viewport, canvas.width, canvas.height);
   gl.uniform1f(uniforms.splatScale, Number.parseFloat(ui["splat-scale"].value));
@@ -487,11 +941,13 @@ function attachWorker(newWorker, generation, fileBytes) {
     const data = event.data;
     if (data.type === "header") {
       ui["splat-count"].textContent = formatCount(data.vertexCount);
+      ui["light-proxy-count"].textContent = formatCount(data.lightProxyCount);
+      ui["file-name"].textContent = `${data.fileName} · ${data.gaussianKind}`;
     } else if (data.type === "progress") {
       const ratio = data.totalBytes ? data.bytes / data.totalBytes : 0;
       setProgress(
         ratio * 0.97,
-        "3DGS PLY を解析しています",
+        "Gaussian PLY を解析しています",
         `${formatBytes(data.bytes)} / ${formatBytes(data.totalBytes)} · ${formatCount(data.count)} ガウシアン`,
       );
     } else if (data.type === "ready") {
@@ -536,6 +992,7 @@ function uploadTexture(data) {
     );
   }
   gl.bindTexture(gl.TEXTURE_2D, splatTexture);
+  textureData = new Uint32Array(data.texdata);
   gl.texImage2D(
     gl.TEXTURE_2D,
     0,
@@ -545,7 +1002,7 @@ function uploadTexture(data) {
     0,
     gl.RGBA_INTEGER,
     gl.UNSIGNED_INT,
-    new Uint32Array(data.texdata),
+    textureData,
   );
   const uploadError = gl.getError();
   if (uploadError !== gl.NO_ERROR) {
@@ -559,8 +1016,9 @@ function uploadTexture(data) {
   fitBounds(bounds.robust || bounds.all);
   lastSortRow = null;
   sortInFlight = false;
-  ui["splat-count"].textContent = formatCount(splatCount);
-  ui["file-name"].textContent = data.fileName;
+  ui["splat-count"].textContent = formatCount(data.sceneVertexCount || splatCount);
+  ui["file-name"].textContent = `${data.fileName} · ${data.gaussianKind}`;
+  initializeLightControls(data.lightBindings);
 }
 
 function startLoad(message, fileBytes, transfer) {
@@ -571,9 +1029,12 @@ function startLoad(message, fileBytes, transfer) {
   sortedCount = 0;
   sortInFlight = false;
   lastSortRow = null;
+  textureData = null;
+  latestViewProjection = null;
+  initializeLightControls([]);
   worker = new Worker("/gs-worker.js");
   attachWorker(worker, generation, fileBytes);
-  setProgress(0.02, "3DGS PLY を読み込んでいます", "接続中…");
+  setProgress(0.02, "Gaussian PLY を読み込んでいます", "接続中…");
   worker.postMessage(message, transfer || []);
 }
 
@@ -581,19 +1042,34 @@ async function loadServerFile() {
   const entryGeneration = loadGeneration;
   let fileBytes = 0;
   let fileName = "pointcloud.ply";
+  let lightSources = null;
+  let rendererHint = null;
   try {
     const response = await fetch("/metadata.json", { cache: "no-store" });
     if (response.ok) {
       const summary = await response.json();
       fileBytes = summary.fileBytes || 0;
       fileName = summary.fileName || fileName;
+      rendererHint = summary.gaussianKind || null;
+      if (summary.lightPackage?.available) {
+        const registryResponse = await fetch(summary.lightPackage.registryUrl, { cache: "no-store" });
+        if (!registryResponse.ok) throw new Error(`光源 JSON の取得に失敗しました: HTTP ${registryResponse.status}`);
+        lightSources = await registryResponse.json();
+      }
     }
-  } catch {
-    // metadata is optional
+  } catch (error) {
+    showError(error instanceof Error ? error.message : String(error));
+    return;
   }
   if (entryGeneration !== loadGeneration) return; // a local-file load won the race
   ui["file-name"].textContent = fileName;
-  startLoad({ type: "load-url", url: "/pointcloud.ply", fileName }, fileBytes);
+  startLoad({
+    type: "load-url",
+    url: "/pointcloud.ply",
+    fileName,
+    lightSources,
+    rendererHint,
+  }, fileBytes);
 }
 
 function loadLocalFile(file) {
@@ -609,6 +1085,31 @@ ui["splat-scale"].addEventListener("input", () => {
 });
 ui["alpha-threshold"].addEventListener("input", () => {
   ui["alpha-threshold-value"].textContent = Number.parseFloat(ui["alpha-threshold"].value).toFixed(2);
+});
+ui["lights-enabled"].addEventListener("input", updateAllLightTextures);
+ui["master-intensity"].addEventListener("input", () => {
+  ui["master-intensity-value"].textContent = `${Number.parseFloat(ui["master-intensity"].value).toFixed(2)}×`;
+  updateAllLightTextures();
+});
+ui["fixture-select"].addEventListener("change", syncSelectedLightControls);
+ui["fixture-enabled"].addEventListener("input", () => {
+  const state = selectedLightState();
+  if (!state) return;
+  state.enabled = ui["fixture-enabled"].checked;
+  updateLightTexture(lightBindings.find((binding) => binding.fixtureId === ui["fixture-select"].value));
+});
+ui["fixture-intensity"].addEventListener("input", () => {
+  const state = selectedLightState();
+  if (!state) return;
+  state.intensity = Number.parseFloat(ui["fixture-intensity"].value);
+  ui["fixture-intensity-value"].textContent = `${state.intensity.toFixed(2)}×`;
+  updateLightTexture(lightBindings.find((binding) => binding.fixtureId === ui["fixture-select"].value));
+});
+ui["fixture-color"].addEventListener("input", () => {
+  const state = selectedLightState();
+  if (!state) return;
+  state.color = hexToColor(ui["fixture-color"].value);
+  updateLightTexture(lightBindings.find((binding) => binding.fixtureId === ui["fixture-select"].value));
 });
 for (const [axis, id] of [[0, "flip-x"], [1, "flip-y"], [2, "flip-z"]]) {
   ui[id].addEventListener("input", () => {
@@ -671,20 +1172,40 @@ ui["file-input"].addEventListener("change", () => {
   ui["file-input"].value = ""; // allow re-selecting the same file
 });
 
-const pointer = { active: false, id: null, x: 0, y: 0, mode: "orbit" };
+const pointer = {
+  active: false,
+  id: null,
+  x: 0,
+  y: 0,
+  startX: 0,
+  startY: 0,
+  moved: false,
+  button: 0,
+  mode: "orbit",
+};
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 canvas.addEventListener("pointerdown", (event) => {
   pointer.active = true;
   pointer.id = event.pointerId;
   pointer.x = event.clientX;
   pointer.y = event.clientY;
+  pointer.startX = event.clientX;
+  pointer.startY = event.clientY;
+  pointer.moved = false;
+  pointer.button = event.button;
   pointer.mode = event.button === 2 || event.shiftKey ? "pan" : "orbit";
   canvas.setPointerCapture(event.pointerId);
 });
 canvas.addEventListener("pointermove", (event) => {
-  if (!pointer.active || event.pointerId !== pointer.id) return;
+  if (!pointer.active || event.pointerId !== pointer.id) {
+    canvas.style.cursor = findLightAt(event.clientX, event.clientY, 18) ? "pointer" : "default";
+    return;
+  }
   const dx = event.clientX - pointer.x;
   const dy = event.clientY - pointer.y;
+  if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > 4) {
+    pointer.moved = true;
+  }
   pointer.x = event.clientX;
   pointer.y = event.clientY;
   if (pointer.mode === "orbit") {
@@ -703,6 +1224,9 @@ canvas.addEventListener("pointermove", (event) => {
 });
 const finishPointer = (event) => {
   if (event.pointerId === pointer.id) {
+    if (!pointer.moved && pointer.button === 0 && pointer.mode === "orbit") {
+      selectLight(findLightAt(event.clientX, event.clientY));
+    }
     pointer.active = false;
     pointer.id = null;
   }
@@ -714,7 +1238,8 @@ canvas.addEventListener("wheel", (event) => {
   orbit.distance *= Math.exp(Math.max(-120, Math.min(120, event.deltaY)) * 0.0015);
   orbit.distance = Math.max(1e-4, Math.min(orbit.fullRadius * 1000, orbit.distance));
 }, { passive: false });
-canvas.addEventListener("dblclick", () => {
+canvas.addEventListener("dblclick", (event) => {
+  if (selectLight(findLightAt(event.clientX, event.clientY))) return;
   if (bounds) fitBounds(bounds.robust || bounds.all);
 });
 

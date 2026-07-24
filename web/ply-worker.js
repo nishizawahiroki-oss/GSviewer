@@ -61,10 +61,10 @@ function parseHeader(buffer) {
   let recordBytes = 0;
   let cameraElementCount = 0;
   let cameraRecordBytes = 0;
+  const elements = [];
   const properties = [];
   const cameraProperties = [];
   const comments = [];
-  const otherElements = [];
 
   for (const rawLine of lines.slice(1)) {
     const line = rawLine.trim();
@@ -78,16 +78,30 @@ function parseHeader(buffer) {
       currentElement = parts[1];
       const count = Number.parseInt(parts[2], 10);
       if (!Number.isSafeInteger(count) || count < 0) fail(`Invalid element count: ${line}`);
+      elements.push({ name: currentElement, count, recordBytes: 0, variableLength: false });
       if (currentElement === "vertex") vertexCount = count;
       else if (currentElement === "camera") cameraElementCount = count;
-      else if (count > 0) otherElements.push(`${currentElement}=${count}`);
-    } else if (parts[0] === "property" && (currentElement === "vertex" || currentElement === "camera")) {
-      if (parts[1] === "list") fail("List properties are not supported.");
+    } else if (parts[0] === "property") {
+      const element = elements[elements.length - 1];
+      if (!element) fail(`Property appears before an element: ${line}`);
+      if (parts[1] === "list") {
+        if (
+          parts.length !== 5
+          || !TYPE_INFO[parts[2]]
+          || !TYPE_INFO[parts[3]]
+          || element.name !== "face"
+        ) {
+          fail(`Unsupported list property: ${line}`);
+        }
+        element.variableLength = true;
+        continue;
+      }
       if (parts.length !== 3 || !TYPE_INFO[parts[1]]) fail(`Unsupported property: ${line}`);
+      element.recordBytes += TYPE_INFO[parts[1]].size;
       if (currentElement === "vertex") {
         properties.push({ name: parts[2], type: parts[1], offset: recordBytes });
         recordBytes += TYPE_INFO[parts[1]].size;
-      } else {
+      } else if (currentElement === "camera") {
         cameraProperties.push({ name: parts[2], type: parts[1], offset: cameraRecordBytes });
         cameraRecordBytes += TYPE_INFO[parts[1]].size;
       }
@@ -98,8 +112,32 @@ function parseHeader(buffer) {
     fail("Only binary_little_endian PLY 1.0 is supported.");
   }
   if (!Number.isSafeInteger(vertexCount) || vertexCount <= 0) fail("PLY has no vertices.");
-  if (otherElements.length) fail(`Additional PLY elements are not supported: ${otherElements.join(", ")}`);
-  if (headerBytes + vertexCount * recordBytes + cameraElementCount * cameraRecordBytes !== buffer.byteLength) {
+  const otherElements = elements.filter(
+    (element) => !["vertex", "camera", "face"].includes(element.name) && element.count,
+  );
+  if (otherElements.length) {
+    fail(
+      `Additional PLY elements are not supported: ${otherElements
+        .map((element) => `${element.name}=${element.count}`)
+        .join(", ")}`,
+    );
+  }
+  const variableElements = elements.filter((element) => element.variableLength);
+  if (variableElements.some((element) => element.name !== "face")) {
+    fail("Variable-length PLY elements other than face are not supported.");
+  }
+  if (variableElements.length && cameraElementCount) {
+    fail("PLY files containing both face lists and camera elements are not supported.");
+  }
+  const fixedPayloadBytes = elements
+    .filter((element) => !element.variableLength)
+    .reduce((total, element) => total + element.count * element.recordBytes, 0);
+  const minimumSize = headerBytes + fixedPayloadBytes;
+  if (
+    variableElements.length
+      ? buffer.byteLength < minimumSize
+      : buffer.byteLength !== minimumSize
+  ) {
     fail(
       `PLY size does not match its header (${buffer.byteLength.toLocaleString()} bytes received).`,
     );
@@ -119,6 +157,7 @@ function parseHeader(buffer) {
     cameraElementCount,
     cameraRecordBytes,
     cameraProperties,
+    faceCount: elements.find((element) => element.name === "face")?.count || 0,
   };
 }
 
@@ -509,6 +548,10 @@ function parsePly(buffer, fileName) {
       fileBytes: buffer.byteLength,
       vertexCount: header.vertexCount,
       recordBytes: header.recordBytes,
+      mesh: {
+        available: header.faceCount > 0,
+        faceCount: header.faceCount,
+      },
       comments: header.comments,
       layout,
       bounds,
