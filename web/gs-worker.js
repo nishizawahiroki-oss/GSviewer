@@ -121,13 +121,21 @@ function parseHeaderText(text) {
     return property.offset;
   };
 
+  // 2D Gaussian splats (surfels) are flat and store only scale_0/scale_1; the
+  // third axis is the disk normal.  scale[2] === -1 flags that missing scale so
+  // processRecords can render a near-flat disk instead of failing.
+  const scale2 = byName.scale_2;
   const plan = {
     count,
     stride,
     x: requireFloat("x"),
     y: requireFloat("y"),
     z: requireFloat("z"),
-    scale: [requireFloat("scale_0"), requireFloat("scale_1"), requireFloat("scale_2")],
+    scale: [
+      requireFloat("scale_0"),
+      requireFloat("scale_1"),
+      scale2 && FLOAT_TYPES.has(scale2.type) ? scale2.offset : -1,
+    ],
     rot: [requireFloat("rot_0"), requireFloat("rot_1"), requireFloat("rot_2"), requireFloat("rot_3")],
     opacity: byName.opacity && FLOAT_TYPES.has(byName.opacity.type) ? byName.opacity.offset : -1,
     filter3d: byName.filter_3D && FLOAT_TYPES.has(byName.filter_3D.type) ? byName.filter_3D.offset : -1,
@@ -253,7 +261,12 @@ async function parseStream(stream, totalBytes, fileName) {
       // Scales are stored as logs.
       let sx = Math.exp(view.getFloat32(base + plan.scale[0], true));
       let sy = Math.exp(view.getFloat32(base + plan.scale[1], true));
-      let sz = Math.exp(view.getFloat32(base + plan.scale[2], true));
+      // 2DGS surfels have no scale_2 (plan.scale[2] === -1): render a near-flat
+      // disk whose thickness is a tiny fraction of its in-plane extent, so the
+      // world covariance stays well-conditioned and the disk reads as flat.
+      let sz = plan.scale[2] >= 0
+        ? Math.exp(view.getFloat32(base + plan.scale[2], true))
+        : Math.min(sx, sy) * 1e-3;
 
       // Mip-Splatting 3D filter: widen the gaussian and compensate opacity.
       if (hasFilter) {

@@ -346,10 +346,13 @@ def detect_camera_layout(header: PlyHeader) -> CameraLayout:
     )
 
 
+# Properties shared by 3D and 2D Gaussian splats.  2DGS surfels are flat, so
+# they carry only scale_0/scale_1 (the third axis is the disk normal); scale_2
+# is therefore not required here.
 GAUSSIAN_PROPERTIES = (
     "f_dc_0", "f_dc_1", "f_dc_2",
     "opacity",
-    "scale_0", "scale_1", "scale_2",
+    "scale_0", "scale_1",
     "rot_0", "rot_1", "rot_2", "rot_3",
 )
 
